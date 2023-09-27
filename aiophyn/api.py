@@ -11,16 +11,25 @@ from aiohttp import ClientSession, ClientTimeout
 from aiohttp.client_exceptions import ClientError
 from pycognito.aws_srp import AWSSRP
 
+from .partners import KOHLER_API
 from .device import Device
-from .errors import RequestError
+from .errors import BrandError, RequestError
 from .home import Home
 
 _LOGGER = logging.getLogger(__name__)
 
+BRANDS = {
+    'phyn': 0,
+    'kohler': 1,
+}
+
 DEFAULT_HEADER_CONTENT_TYPE: str = "application/json"
 DEFAULT_HEADER_USER_AGENT: str = "phyn/18 CFNetwork/1331.0.7 Darwin/21.4.0"
 DEFAULT_HEADER_CONNECTION: str = "keep-alive"
-DEFAULT_HEADER_API_KEY: str = "E7nfOgW6VI64fYpifiZSr6Me5w1Upe155zbu4lq8"
+DEFAULT_HEADER_API_KEY: list[str] = [
+    "E7nfOgW6VI64fYpifiZSr6Me5w1Upe155zbu4lq8",
+    "OOLFiYu7Ts5RKI4BV6WeI3zb38HU76vZ8x5lFX6Y",
+]
 DEFAULT_HEADER_ACCEPT: str = "application/json"
 DEFAULT_HEADER_ACCEPT_ENCODING: str = "gzip, deflate, br"
 
@@ -35,17 +44,32 @@ class API:
     """Define the API object."""
 
     def __init__(
-        self, username: str, password: str, *, session: Optional[ClientSession] = None
+        self, username: str, password: str, *, phyn_brand: str, session: Optional[ClientSession] = None
     ) -> None:
         """Initialize."""
+        if phyn_brand not in BRANDS:
+            raise BrandError("Invalid phyn brand")
+
+        self._brand: str = BRANDS[phyn_brand]
+
         self._username: str = username
-        self._password: str = password
+        if self._brand != BRANDS['phyn']:
+            self._password: str = None
+            self._partner_api = None
+            self._partner_password: str = password
+            self._cognito: dict[str] = None
+        else:
+            self._password: str = password
+            self._cognito: dict[str] = {
+                "app_client_id": COGNITO_CLIENT_ID,
+                "pool_id": COGNITO_POOL_ID,
+                "region": COGNITO_REGION,
+            }
+
         self._session: ClientSession = session
 
         self._token: Optional[str] = None
         self._token_expiration: Optional[datetime] = None
-        self._user_id: Optional[str] = None
-        self._username: str = username
 
         self.home: Home = Home(self._request)
         self.device: Device = Device(self._request)
@@ -70,7 +94,7 @@ class API:
                 "Content-Type": DEFAULT_HEADER_CONTENT_TYPE,
                 "User-Agent": DEFAULT_HEADER_USER_AGENT,
                 "Connection": DEFAULT_HEADER_CONNECTION,
-                "x-api-key": DEFAULT_HEADER_API_KEY,
+                "x-api-key": DEFAULT_HEADER_API_KEY[self._brand],
                 "Accept": DEFAULT_HEADER_ACCEPT,
                 "Accept-Encoding": DEFAULT_HEADER_ACCEPT_ENCODING,
             }
@@ -99,6 +123,14 @@ class API:
 
     async def async_authenticate(self) -> None:
         """Authenticate the user and set the access token with its expiration."""
+        if self._brand == BRANDS["kohler"]:
+            if self._password == None:
+                _LOGGER.info("Auhenticating to Kohler")
+                self._partner_api = KOHLER_API(self._username, self._partner_password)
+                await self._partner_api.authenticate()
+                self._password = self._partner_api.get_phyn_password()
+                self._cognito = self._partner_api.get_cognito_info()
+
         executor = ThreadPoolExecutor()
         future = executor.submit(self._authenticate)
         auth_response = await asyncio.wrap_future(future)
@@ -111,12 +143,13 @@ class API:
 
     def _authenticate(self):
         """boto3 is synchronous, so authenticate in a separate thread."""
-        client = boto3.client("cognito-idp", region_name=COGNITO_REGION)
+        _LOGGER.info("Requesting token from AWS")
+        client = boto3.client("cognito-idp", region_name=self._cognito['region'])
         aws = AWSSRP(
             username=self._username,
             password=self._password,
-            pool_id=COGNITO_POOL_ID,
-            client_id=COGNITO_CLIENT_ID,
+            pool_id=self._cognito['pool_id'],
+            client_id=self._cognito['app_client_id'],
             client=client,
         )
         auth_response = aws.authenticate_user()
@@ -124,7 +157,7 @@ class API:
 
 
 async def async_get_api(
-    username: str, password: str, *, session: Optional[ClientSession] = None
+    username: str, password: str, *, phyn_brand: str = "phyn", session: Optional[ClientSession] = None
 ) -> API:
     """Instantiate an authenticated API object.
 
@@ -134,8 +167,10 @@ async def async_get_api(
     :type email: ``str``
     :param password: A Phyn password
     :type password: ``str``
+    :param phyn_brand: A brand for phyn
+    :type phyn_brand: ``str``
     :rtype: :meth:`aiophyn.api.API`
     """
-    api = API(username, password, session=session)
+    api = API(username, password, phyn_brand=phyn_brand, session=session)
     await api.async_authenticate()
     return api

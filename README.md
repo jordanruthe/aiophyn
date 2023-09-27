@@ -1,6 +1,6 @@
 # aiophyn
 
-An asynchronous library for Phyn Smart Water devices.
+An asynchronous library for Phyn Smart Water devices including Kohler's H2Wise+.
 
 This library is initially focused on supporting a Phyn integration for Home Assistant, providing:
 
