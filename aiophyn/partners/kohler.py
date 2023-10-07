@@ -35,13 +35,16 @@ class KOHLER_API:
         self._token_expiration = None
         self._refresh_token = None
         self._refresh_token_expiration = None
-        self._cognito = None
+        self._mobile_data = None
 
         self._session: ClientSession = session
 
     def get_cognito_info(self):
-        return self._cognito
-        
+        return self._mobile_data['cognito']
+
+    def get_mqtt_info(self):
+        return self._mobile_data['wss']
+
     def get_phyn_password(self):
         return self._phyn_password
 
@@ -152,7 +155,7 @@ class KOHLER_API:
           "User-Agent": "okhttp/4.10.0"
         }
 
-        _LOGGER.debug("Getting Kohler settings from Phyn")
+        _LOGGER.info("Getting Kohler settings from Phyn")
         resp = await self._session.get("https://api.phyn.com/settings/app/com.kohler.mobile?%s" % args, headers=headers)
         mobile_data = await resp.json()
         if "error_msg" in mobile_data:
@@ -162,7 +165,7 @@ class KOHLER_API:
         if "cognito" not in mobile_data:
             await self._session.close()
             raise Exception("Unable to find cognito information")
-        self._cognito = mobile_data['cognito']
+        self._mobile_data = mobile_data
 
         _LOGGER.debug("Getting token from Phyn")
         params = {
@@ -187,7 +190,6 @@ class KOHLER_API:
         return data['token']
 
     async def token_to_password(self, token):
-        _LOGGER.debug("Decryption password from token")
         b64hex = base64.b64decode((token + '=' * (5 - (len(token) % 4))).replace('_','/').replace('-','+')).hex()
         key = "656c7330336659334872306e55446a4c" # AES Key for kohler
         iv = b64hex[18:(18+32)]

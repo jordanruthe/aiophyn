@@ -2,7 +2,7 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -12,9 +12,13 @@ from aiohttp.client_exceptions import ClientError
 from pycognito.aws_srp import AWSSRP
 
 from .partners import KOHLER_API
+from .mqtt import MQTTClient
 from .device import Device
 from .errors import BrandError, RequestError
 from .home import Home
+
+from .const import API_BASE
+
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -67,14 +71,18 @@ class API:
             }
 
         self._session: ClientSession = session
+        self._iot_id = None
+        self._iot_credentials = None
+        self.mqtt = None
 
         self._token: Optional[str] = None
         self._token_expiration: Optional[datetime] = None
 
         self.home: Home = Home(self._request)
         self.device: Device = Device(self._request)
+        self.mqtt = MQTTClient(self)
 
-    async def _request(self, method: str, url: str, **kwargs) -> dict:
+    async def _request(self, method: str, url: str, token_type:str = "access", **kwargs) -> dict:
         """Make a request against the API."""
         if self._token_expiration and datetime.now() >= self._token_expiration:
             _LOGGER.info("Requesting new access token to replace expired one")
@@ -100,8 +108,12 @@ class API:
             }
         )
 
-        if self._token:
-            kwargs["headers"]["Authorization"] = self._token
+        if token_type == "access":
+            if self._token:
+                kwargs["headers"]["Authorization"] = self._token
+        elif token_type == "id":
+            if self._id_token:
+                kwargs["headers"]["Authorization"] = self._id_token
 
         use_running_session = self._session and not self._session.closed
 
@@ -130,6 +142,7 @@ class API:
                 await self._partner_api.authenticate()
                 self._password = self._partner_api.get_phyn_password()
                 self._cognito = self._partner_api.get_cognito_info()
+                self._mqtt_settings = self._partner_api.get_mqtt_info()
 
         executor = ThreadPoolExecutor()
         future = executor.submit(self._authenticate)
@@ -137,9 +150,13 @@ class API:
 
         access_token = auth_response["AuthenticationResult"]["AccessToken"]
         expires_in = auth_response["AuthenticationResult"]["ExpiresIn"]
+        id_token = auth_response["AuthenticationResult"]["IdToken"]
+        refresh_token = auth_response["AuthenticationResult"]["RefreshToken"]
 
         self._token = access_token
         self._token_expiration = datetime.now() + timedelta(seconds=expires_in)
+        self._id_token = id_token
+        self._refresh_token = refresh_token
 
     def _authenticate(self):
         """boto3 is synchronous, so authenticate in a separate thread."""
