@@ -14,13 +14,15 @@ USERNAME = "USERNAME_HERE"
 PASSWORD = "PASSWORD_HERE"
 BRAND = "BRAND" # phyn or kohler
 
+async def on_message(device_id, data):
+    _LOGGER.info("Message for %s: %s" % (device_id, data))
 
 async def main() -> None:
     """Create the aiohttp session and run the example."""
     logging.basicConfig(level=logging.INFO)
     async with ClientSession() as session:
         try:
-            api = await async_get_api(USERNAME, PASSWORD, phyn_brand=BRAND, session=session)
+            api = await async_get_api(USERNAME, PASSWORD, phyn_brand=BRAND, session=session, verify_ssl=False)
 
             all_home_info = await api.home.get_homes(USERNAME)
             _LOGGER.info(all_home_info)
@@ -32,14 +34,11 @@ async def main() -> None:
             device_state = await api.device.get_state(first_device_id)
             _LOGGER.info(device_state)
 
-            duration_today = date.today().strftime("%Y/%m/%d")
-            consumption_info = await api.device.get_consumption(
-                first_device_id, duration_today, details=True
-            )
-            _LOGGER.info(consumption_info)
+            await api.mqtt.add_event_handler("update", on_message)
+            await api.mqtt.subscribe("prd/app_subscriptions/%s" % home_info['device_ids'][0])
 
-            valve_status = device_state["sov_status"]["v"]
-            _LOGGER.info(valve_status)
+            await asyncio.sleep(60)
+
 
             # close_valve_response = await api.device.close_valve(first_device_id)
             # _LOGGER.info(close_valve_response)
