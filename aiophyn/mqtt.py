@@ -133,6 +133,7 @@ class MQTTClient:
                 self.host,
                 self.port,
             )
+        await self.connect_evt.wait()
 
     async def get_mqtt_info(self):
         user_id = urllib.parse.quote_plus(self.api._username)
@@ -144,6 +145,7 @@ class MQTTClient:
         except:
             Exception("Could not get WebSocket/MQTT url from API")
 
+        _LOGGER.debug("MQTT info: %s" % wss_data)
         match = re.match(r'wss:\/\/([a-zA-Z0-9\.\-]+)(\/mqtt?.*)', wss_data['wss_url'])
         if not match:
             raise Exception("Could not find WebSocket/MQTT url")
@@ -154,6 +156,7 @@ class MQTTClient:
     async def subscribe(self, topic):
         _LOGGER.info("Attempting to subscribe to: %s" % topic)
         res, msg_id = self.client.subscribe(topic, 0)
+        self.topics.append(topic)
         self.pending_acks[msg_id] = topic
 
 
@@ -262,7 +265,6 @@ class MQTTClient:
     ) -> None:
         if mid in self.pending_acks:
             _LOGGER.info("Subscribed to: %s" % self.pending_acks[mid])
-            self.topics.append(self.pending_acks[mid])
             del self.pending_acks[mid]
         else:
             _LOGGER.info(("Subscribed: %s" % userdata) +str(mid)+" "+str(granted_qos))

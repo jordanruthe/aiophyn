@@ -174,7 +174,8 @@ class API:
 
 
 async def async_get_api(
-    username: str, password: str, *, phyn_brand: str = "phyn", session: Optional[ClientSession] = None
+    username: str, password: str, *, phyn_brand: str = "phyn", session: Optional[ClientSession] = None,
+    verify_ssl: bool = True
 ) -> API:
     """Instantiate an authenticated API object.
 
