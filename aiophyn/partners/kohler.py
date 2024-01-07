@@ -1,14 +1,11 @@
 """ Define Kohler Partner class """
 
 import logging
-import asyncio
 import re
 import uuid
 import json
 import base64
 import binascii
-import hashlib
-from Crypto import Random
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
@@ -17,7 +14,6 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from aiohttp import ClientSession, ClientTimeout, CookieJar
-from aiohttp.client_exceptions import ClientError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,7 +21,8 @@ DEFAULT_TIMEOUT: int = 10
 
 class KOHLER_API:
     def __init__(
-        self, username: str, password: str, session: Optional[ClientSession] = None
+        self, username: str, password: str, session: Optional[ClientSession] = None,
+        verify_ssl: bool = True, proxy: Optional[str] = None, proxy_port: Optional[int] = None
     ):
         self._username: str = username
         self._password: str = password
@@ -38,7 +35,15 @@ class KOHLER_API:
         self._refresh_token_expiration = None
         self._mobile_data = None
 
-        self._session: ClientSession = session
+        self.verify_ssl = verify_ssl
+        self.ssl = False if verify_ssl is False else None
+        self.proxy = proxy
+        self.proxy_port = proxy_port
+        self.proxy_url: Optional[str] = None
+        if self.proxy is not None and self.proxy_port is not None:
+            self.proxy_url = "https://%s:%s" % (proxy, proxy_port)
+
+        self._session: ClientSession = None
 
     def get_cognito_info(self):
         return self._mobile_data['cognito']
@@ -72,39 +77,40 @@ class KOHLER_API:
           "redirect_uri": "msauth%3A%2F%2Fcom.kohler.hermoth%2F2DuDM2vGmcL4bKPn2xKzKpsy68k%253D",
           "prompt": "login",
         }
-        get_vars = '&'.join([ "%s=%s" % (x, params[x]) for x in params.keys() ])
-        resp = await self._session.get('https://konnectkohler.b2clogin.com/tfp/konnectkohler.onmicrosoft.com/B2C_1A_signin/oAuth2/v2.0/authorize?' + get_vars)
+        get_vars = '&'.join([ f"{x[0]}={x[1]}" for x in params.items() ])
+        resp = await self._session.get(
+            'https://konnectkohler.b2clogin.com/tfp/konnectkohler.onmicrosoft.com/B2C_1A_signin/oAuth2/v2.0/authorize?'
+            + get_vars, ssl=self.ssl, proxy=self.proxy_url)
         match = re.search(r'"(StateProperties=([a-zA-Z0-9]+))"', await resp.text())
         state_properties = match.group(1)
 
         cookies = self._session.cookie_jar.filter_cookies('https://konnectkohler.b2clogin.com')
-        TRANS = None
-        CSRF = None
+        csrf = None
         for key, cookie in cookies.items():
-          if key == "x-ms-cpim-csrf":
-            CSRF = cookie.value
-          if key == "x-ms-cpim-trans":
-            TRANS = cookie.value
+            if key == "x-ms-cpim-csrf":
+                csrf = cookie.value
 
         # Login
         headers = {
-            "X-CSRF-TOKEN": CSRF,
+            "X-CSRF-TOKEN": csrf,
         }
         login_vars = {
             "request_type": "RESPONSE",
             "signInName": self._username,
             "password": self._password,
         }
-        resp = await self._session.post("https://konnectkohler.b2clogin.com/konnectkohler.onmicrosoft.com/B2C_1A_signin/SelfAsserted?p=B2C_1A_signin&" + state_properties, headers=headers, data=login_vars)
+        resp = await self._session.post("https://konnectkohler.b2clogin.com/konnectkohler.onmicrosoft.com/B2C_1A_signin/SelfAsserted?p=B2C_1A_signin&" + state_properties, headers=headers, data=login_vars,
+                                        ssl=self.ssl, proxy=self.proxy_url)
 
         params = {
             "rememberMe": "false",
-            "csrf_token": CSRF,
+            "csrf_token": csrf,
             "tx": state_properties,
             "p": "B2C_1A_signin"
         }
-        args = '&'.join([ "%s=%s" % (x, params[x]) for x in params.keys() ])
-        resp = await self._session.get("https://konnectkohler.b2clogin.com/konnectkohler.onmicrosoft.com/B2C_1A_signin/api/CombinedSigninAndSignup/confirmed?" + args, allow_redirects=False)
+        args = '&'.join([ f"{x[0]}={x[1]}" for x in params.items() ])
+        resp = await self._session.get("https://konnectkohler.b2clogin.com/konnectkohler.onmicrosoft.com/B2C_1A_signin/api/CombinedSigninAndSignup/confirmed?" + args, allow_redirects=False,
+                                       ssl=self.ssl, proxy=self.proxy_url)
         matches = re.search(r'code=([^&]+)', resp.headers['Location'])
         code = matches.group(1)
 
@@ -124,7 +130,8 @@ class KOHLER_API:
             "grant_type": "authorization_code",
             "code": code,
         }
-        resp = await self._session.post("https://konnectkohler.b2clogin.com/tfp/konnectkohler.onmicrosoft.com/B2C_1A_signin/%2FoAuth2%2Fv2.0%2Ftoken", data=params)
+        resp = await self._session.post("https://konnectkohler.b2clogin.com/tfp/konnectkohler.onmicrosoft.com/B2C_1A_signin/%2FoAuth2%2Fv2.0%2Ftoken", data=params,
+                                        ssl=self.ssl, proxy=self.proxy_url)
 
         data = await resp.json()
         if "client_info" not in data:
@@ -147,17 +154,18 @@ class KOHLER_API:
           "partner_user_id": self._user_id,
           "email": self._username,
         }
-        args = "&".join(["%s=%s" % (x, params[x]) for x in params.keys()])
+        args = "&".join([ f"{x[0]}={x[1]}" for x in params.items() ])
         headers = {
           "Accept": "application/json",
           "Accept-encoding": "gzip",
-          "Authorization": "Bearer partner-%s" % self._token,
+          "Authorization": f"Bearer partner-{self._token}",
           "Content-Type": "application/json",
           "User-Agent": "okhttp/4.10.0"
         }
 
         _LOGGER.info("Getting Kohler settings from Phyn")
-        resp = await self._session.get("https://api.phyn.com/settings/app/com.kohler.mobile?%s" % args, headers=headers)
+        resp = await self._session.get(f"https://api.phyn.com/settings/app/com.kohler.mobile?{args}", headers=headers,
+                                       ssl=self.ssl, proxy=self.proxy_url)
         mobile_data = await resp.json()
         if "error_msg" in mobile_data:
             await self._session.close()
@@ -182,7 +190,8 @@ class KOHLER_API:
           "Content-Type": "application/json",
           "x-api-key": mobile_data['pws_api']['app_api_key']
         }
-        resp = await self._session.get("https://api.phyn.com/partner-user-setup/token?%s" % args, headers=headers)
+        resp = await self._session.get(f"https://api.phyn.com/partner-user-setup/token?{args}", headers=headers,
+                                       ssl=self.ssl, proxy=self.proxy_url)
         data = await resp.json()
         if "token" not in data:
             await self._session.close()

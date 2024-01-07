@@ -48,7 +48,8 @@ class API:
     """Define the API object."""
 
     def __init__(
-        self, username: str, password: str, *, phyn_brand: str, session: Optional[ClientSession] = None
+        self, username: str, password: str, *, phyn_brand: str, session: Optional[ClientSession] = None,
+        client_id: Optional[str] = None, verify_ssl: bool = True, proxy: Optional[str] = None, proxy_port: Optional[int] = None
     ) -> None:
         """Initialize."""
         if phyn_brand not in BRANDS:
@@ -75,12 +76,19 @@ class API:
         self._iot_credentials = None
         self.mqtt = None
 
+        self.verify_ssl = verify_ssl
+        self.proxy = proxy
+        self.proxy_port = proxy_port
+        self.proxy_url: Optional[str] = None
+        if self.proxy is not None and self.proxy_port is not None:
+            self.proxy_url = "https://%s:%s" % (proxy, proxy_port)
+
         self._token: Optional[str] = None
         self._token_expiration: Optional[datetime] = None
 
         self.home: Home = Home(self._request)
         self.device: Device = Device(self._request)
-        self.mqtt = MQTTClient(self)
+        self.mqtt = MQTTClient(self, client_id=client_id, verify_ssl=verify_ssl, proxy=proxy, proxy_port=proxy_port)
 
     async def _request(self, method: str, url: str, token_type:str = "access", **kwargs) -> dict:
         """Make a request against the API."""
@@ -114,6 +122,12 @@ class API:
         elif token_type == "id":
             if self._id_token:
                 kwargs["headers"]["Authorization"] = self._id_token
+        
+        if self.proxy_url is not None:
+            kwargs["proxy"] = self.proxy_url
+        
+        if not self.verify_ssl:
+            kwargs["ssl"] = False
 
         use_running_session = self._session and not self._session.closed
 
@@ -138,7 +152,8 @@ class API:
         if self._brand == BRANDS["kohler"]:
             if self._password == None:
                 _LOGGER.info("Auhenticating to Kohler")
-                self._partner_api = KOHLER_API(self._username, self._partner_password)
+                self._partner_api = KOHLER_API(self._username, self._partner_password, verify_ssl=self.verify_ssl, 
+                                               proxy=self.proxy, proxy_port=self.proxy_port)
                 await self._partner_api.authenticate()
                 self._password = self._partner_api.get_phyn_password()
                 self._cognito = self._partner_api.get_cognito_info()
@@ -175,7 +190,7 @@ class API:
 
 async def async_get_api(
     username: str, password: str, *, phyn_brand: str = "phyn", session: Optional[ClientSession] = None,
-    verify_ssl: bool = True
+    client_id: Optional[str] = None, verify_ssl: bool = True, proxy: Optional[str] = None, proxy_port: Optional[int] = None
 ) -> API:
     """Instantiate an authenticated API object.
 
@@ -189,6 +204,6 @@ async def async_get_api(
     :type phyn_brand: ``str``
     :rtype: :meth:`aiophyn.api.API`
     """
-    api = API(username, password, phyn_brand=phyn_brand, session=session)
+    api = API(username, password, phyn_brand=phyn_brand, session=session, client_id=client_id, verify_ssl=verify_ssl, proxy=proxy, proxy_port=proxy_port)
     await api.async_authenticate()
     return api
