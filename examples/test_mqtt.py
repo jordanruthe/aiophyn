@@ -35,16 +35,14 @@ async def main() -> None:
             _LOGGER.info(device_state)
 
             await api.mqtt.add_event_handler("update", on_message)
-            await api.mqtt.subscribe("prd/app_subscriptions/%s" % home_info['device_ids'][0])
+            await api.mqtt.connect()
+
+            for device in home_info['devices']:
+                if device['product_code'] in ['PP2']:
+                    _LOGGER.info("Found PP2: %s" % device)
+                    await api.mqtt.subscribe("prd/app_subscriptions/%s" % device['device_id'])
 
             await asyncio.sleep(60)
-
-
-            # close_valve_response = await api.device.close_valve(first_device_id)
-            # _LOGGER.info(close_valve_response)
-
-            # open_valve_response = await api.device.open_valve(first_device_id)
-            # _LOGGER.info(open_valve_response)
 
         except PhynError as err:
             _LOGGER.error("There was an error: %s", err)
