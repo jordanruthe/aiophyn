@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from datetime import datetime, timezone
+from typing import Any, Dict, Union, Optional
 
 import inspect
 import json
@@ -15,13 +15,12 @@ import re
 import socks
 import paho.mqtt.client as paho_mqtt
 
-from typing import Any, Dict, Union, Optional
-
 from .const import API_BASE
 
 _LOGGER = logging.getLogger(__name__)
 
 class AIOHelper:
+    """Helper class for Asynchronous IO"""
     def __init__(self, client: paho_mqtt.Client) -> None:
         self.loop = asyncio.get_running_loop()
         self.client = client
@@ -62,9 +61,11 @@ class AIOHelper:
                                     userdata: Any,
                                     sock: socket.socket
                                     ) -> None:
+        # pylint: disable=unused-argument
         self.loop.remove_writer(sock)
 
     async def misc_loop(self) -> None:
+        """Loop for MQTT"""
         while self.client.loop_misc() == paho_mqtt.MQTT_ERR_SUCCESS:
             try:
                 await asyncio.sleep(1)
@@ -103,7 +104,8 @@ class Timer:
         self._task = asyncio.create_task(self._job(timeout))
 
 class MQTTClient:
-    def __init__(self, api, client_id=None, verify_ssl=True, proxy=None, proxy_port=None):
+    """AIO MQTT client """
+    def __init__(self, api, client_id: str =None, verify_ssl: bool =True, proxy: str =None, proxy_port: int =None):
         self.event_loop = asyncio.get_running_loop()
         self.api = api
         self.pending_acks = {}
@@ -114,11 +116,12 @@ class MQTTClient:
         self.reconnect_evt: asyncio.Event = asyncio.Event()
         self.host = None
         self.port = 443
-        
+
         if client_id is None:
             client_id = "aiophyn-%s" % int(time.time())
 
         self.client = paho_mqtt.Client(client_id=client_id, transport="websockets")
+        self.helper: AIOHelper = None
         self.reconnect_timer = Timer(self._process_reconnect)
 
         self.verify_ssl: bool = verify_ssl
@@ -137,6 +140,7 @@ class MQTTClient:
         }
 
     async def add_event_handler(self, type, target):
+        """Add an event handler for MQTT events"""
         if type not in self._handlers.keys():
             return False
 
@@ -152,13 +156,13 @@ class MQTTClient:
         if self.verify_ssl:
             self.client.tls_set()
         else:
-            context = ssl.SSLContext() 
-            context.verify_mode = ssl.CERT_NONE 
+            context = ssl.SSLContext()
+            context.verify_mode = ssl.CERT_NONE
             context.check_hostname = False
             self.client.tls_set_context(context)
             self.client.tls_insecure_set(True)
-        
-        if self.proxy is not None and self.proxy_port is not None: 
+
+        if self.proxy is not None and self.proxy_port is not None:
             self.client.proxy_set(proxy_type=socks.HTTP, proxy_addr=self.proxy, proxy_port=self.proxy_port)
 
         self.helper = AIOHelper(self.client)
@@ -170,12 +174,23 @@ class MQTTClient:
                 self.host,
                 self.port,
             )
+    
+    def disconnect(self):
+        """Disconnect from server"""
+        self.disconnect_evt = asyncio.Event()
+        _LOGGER.info("MQTT client disconnecting...")
+        self.client.disconnect()
+    
+    async def disconnect_and_wait(self):
+        """Disconnect from server and wait"""
+        self.disconnect()
+        await self.disconnect_evt.wait()
 
     async def get_mqtt_info(self):
         """ Gets WebSocket URL and parameters for a MQTT connection
             Returns a list of url and path
         """
-        user_id = urllib.parse.quote_plus(self.api._username)
+        user_id = urllib.parse.quote_plus(self.api.username)
         try:
             wss_data = await self.api._request("post", f"{API_BASE}/users/{user_id}/iot_policy", token_type="id")
         except:
@@ -189,6 +204,7 @@ class MQTTClient:
 
 
     async def subscribe(self, topic):
+        """Subscribe to a MQTT topic"""
         _LOGGER.info("Attempting to subscribe to: %s", topic)
         res, msg_id = self.client.subscribe(topic, 0)
         self.pending_acks[msg_id] = topic
@@ -213,7 +229,7 @@ class MQTTClient:
                 err_str = paho_mqtt.connack_string(reason_code)
             else:
                 err_str = reason_code.getName()
-            _LOGGER.info(f"MQTT Connection Failed: {err_str}")
+            _LOGGER.info("MQTT Connection Failed: %s", err_str)
 
     def _on_disconnect(self,
                        client: paho_mqtt.Client,
@@ -224,6 +240,7 @@ class MQTTClient:
         # pylint: disable=unused-argument
         if self.disconnect_evt is not None:
             self.disconnect_evt.set()
+            _LOGGER.info("Client disconnected, not attempting to reconnect")
         elif self.is_connected():
             # The server connection was dropped, attempt to reconnect
             _LOGGER.info("MQTT Server Disconnected, reason: %s", paho_mqtt.error_string(reason_code))
@@ -251,7 +268,7 @@ class MQTTClient:
         if self.reconnect_evt.is_set():
             _LOGGER.info("Already attempting to reconnect, second attemp cancelled.")
             return
-        
+
         _LOGGER.info("Attempting MQTT Connect/Reconnect")
         self.reconnect_evt.set()
         last_err: Exception = Exception()
@@ -281,7 +298,7 @@ class MQTTClient:
                         self.host,
                         self.port,
                     )
-            
+
                 await asyncio.wait_for(self.connect_evt.wait(), timeout=2.)
                 if not self.connect_evt.is_set():
                     _LOGGER.info("Timeout while waiting for MQTT connection")
@@ -309,7 +326,7 @@ class MQTTClient:
     ) -> None:
         # pylint: disable=unused-argument
         msg = message.payload.decode()
-        _LOGGER.debug("Message received on %s", message.topic)
+        _LOGGER.debug("Message received on %s %s", message.topic, msg)
         try:
             data = json.loads(msg)
         except json.decoder.JSONDecodeError:

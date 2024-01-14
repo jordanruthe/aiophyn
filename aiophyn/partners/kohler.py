@@ -6,23 +6,24 @@ import uuid
 import json
 import base64
 import binascii
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import unpad
 
 from datetime import datetime, timedelta
-
 from typing import Optional
-
 from aiohttp import ClientSession, ClientTimeout, CookieJar
+
+
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT: int = 10
 
 class KOHLER_API:
+    """API for Kohler to access Phyn Devices"""
     def __init__(
-        self, username: str, password: str, session: Optional[ClientSession] = None,
-        verify_ssl: bool = True, proxy: Optional[str] = None, proxy_port: Optional[int] = None
+        self, username: str, password: str, verify_ssl: bool = True, proxy: Optional[str] = None,
+        proxy_port: Optional[int] = None
     ):
         self._username: str = username
         self._password: str = password
@@ -41,20 +42,24 @@ class KOHLER_API:
         self.proxy_port = proxy_port
         self.proxy_url: Optional[str] = None
         if self.proxy is not None and self.proxy_port is not None:
-            self.proxy_url = "https://%s:%s" % (proxy, proxy_port)
+            self.proxy_url = f"https://{proxy}:{proxy_port}"
 
         self._session: ClientSession = None
 
     def get_cognito_info(self):
+        """Get cognito information"""
         return self._mobile_data['cognito']
 
     def get_mqtt_info(self):
+        """Get MQTT url"""
         return self._mobile_data['wss']
 
     def get_phyn_password(self):
+        """Get phyn password"""
         return self._phyn_password
 
     async def authenticate(self):
+        """Authenticate with Kohler and Phyn"""
         use_running_session = self._session and not self._session.closed
         if not use_running_session:
             self._session = ClientSession(timeout=ClientTimeout(total=DEFAULT_TIMEOUT), cookie_jar=CookieJar())
@@ -65,6 +70,7 @@ class KOHLER_API:
         self._phyn_password = await self.token_to_password(token)
 
     async def b2c_login(self):
+        """Login to Kohler"""
         _LOGGER.debug("Logging into Kohler")
         client_request_id = str(uuid.uuid4())
 
@@ -73,7 +79,8 @@ class KOHLER_API:
           "response_type": "code",
           "client_id": "8caf9530-1d13-48e6-867c-0f082878debc",
           "client-request-id": client_request_id,
-          "scope": "https%3A%2F%2Fkonnectkohler.onmicrosoft.com%2Ff5d87f3d-bdeb-4933-ab70-ef56cc343744%2Fapiaccess%20openid%20offline_access%20profile",
+          "scope": "https%3A%2F%2Fkonnectkohler.onmicrosoft.com%2Ff5d87f3d-bdeb-4933-ab70-ef56cc343744%2Fapiaccess%20" + 
+            "openid%20offline_access%20profile",
           "redirect_uri": "msauth%3A%2F%2Fcom.kohler.hermoth%2F2DuDM2vGmcL4bKPn2xKzKpsy68k%253D",
           "prompt": "login",
         }
@@ -99,8 +106,9 @@ class KOHLER_API:
             "signInName": self._username,
             "password": self._password,
         }
-        resp = await self._session.post("https://konnectkohler.b2clogin.com/konnectkohler.onmicrosoft.com/B2C_1A_signin/SelfAsserted?p=B2C_1A_signin&" + state_properties, headers=headers, data=login_vars,
-                                        ssl=self.ssl, proxy=self.proxy_url)
+        resp = await self._session.post("https://konnectkohler.b2clogin.com/konnectkohler.onmicrosoft.com/" +
+                                        "B2C_1A_signin/SelfAsserted?p=B2C_1A_signin&" + state_properties,
+                                        headers=headers, data=login_vars, ssl=self.ssl, proxy=self.proxy_url)
 
         params = {
             "rememberMe": "false",
@@ -109,8 +117,9 @@ class KOHLER_API:
             "p": "B2C_1A_signin"
         }
         args = '&'.join([ f"{x[0]}={x[1]}" for x in params.items() ])
-        resp = await self._session.get("https://konnectkohler.b2clogin.com/konnectkohler.onmicrosoft.com/B2C_1A_signin/api/CombinedSigninAndSignup/confirmed?" + args, allow_redirects=False,
-                                       ssl=self.ssl, proxy=self.proxy_url)
+        resp = await self._session.get("https://konnectkohler.b2clogin.com/konnectkohler.onmicrosoft.com/" +
+                                       "B2C_1A_signin/api/CombinedSigninAndSignup/confirmed?" + args,
+                                       allow_redirects=False, ssl=self.ssl, proxy=self.proxy_url)
         matches = re.search(r'code=([^&]+)', resp.headers['Location'])
         code = matches.group(1)
 
@@ -126,12 +135,14 @@ class KOHLER_API:
             "x-app-name": "com.kohler.hermoth",
             "x-app-ver": "2.7",
             "redirect_uri": "msauth://com.kohler.hermoth/2DuDM2vGmcL4bKPn2xKzKpsy68k%3D",
-            "scope": "https://konnectkohler.onmicrosoft.com/f5d87f3d-bdeb-4933-ab70-ef56cc343744/apiaccess openid offline_access profile",
+            "scope": "https://konnectkohler.onmicrosoft.com/f5d87f3d-bdeb-4933-ab70-ef56cc343744/apiaccess" + 
+                " openid offline_access profile",
             "grant_type": "authorization_code",
             "code": code,
         }
-        resp = await self._session.post("https://konnectkohler.b2clogin.com/tfp/konnectkohler.onmicrosoft.com/B2C_1A_signin/%2FoAuth2%2Fv2.0%2Ftoken", data=params,
-                                        ssl=self.ssl, proxy=self.proxy_url)
+        resp = await self._session.post("https://konnectkohler.b2clogin.com/tfp/konnectkohler.onmicrosoft.com/" +
+                                        "B2C_1A_signin/%2FoAuth2%2Fv2.0%2Ftoken", data=params, ssl=self.ssl,
+                                        proxy=self.proxy_url)
 
         data = await resp.json()
         if "client_info" not in data:
@@ -149,6 +160,7 @@ class KOHLER_API:
         _LOGGER.debug("Received Kohler Token")
 
     async def get_phyn_token(self):
+        """ Get a phyn access token"""
         params = {
           "partner": "kohler",
           "partner_user_id": self._user_id,
@@ -169,7 +181,7 @@ class KOHLER_API:
         mobile_data = await resp.json()
         if "error_msg" in mobile_data:
             await self._session.close()
-            raise Exception("Kohler %s" % mobile_data['error_msg'])
+            raise Exception(f"Kohler {mobile_data['error_msg']}")
 
         if "cognito" not in mobile_data:
             await self._session.close()
@@ -182,11 +194,11 @@ class KOHLER_API:
           "partner": "kohler",
           "partner_user_id": self._user_id
         }
-        args = "&".join(["%s=%s" % (x, params[x]) for x in params.keys()])
+        args = "&".join([ f"{x[0]}={x[1]}" for x in params.items() ])
         headers = {
           "Accept": "application/json, text/plain, */*",
           "Accept-encoding": "gzip",
-          "Authorization": "Bearer partner-%s" % self._token,
+          "Authorization": f"Bearer partner-{self._token}",
           "Content-Type": "application/json",
           "x-api-key": mobile_data['pws_api']['app_api_key']
         }
@@ -200,12 +212,13 @@ class KOHLER_API:
         return data['token']
 
     async def token_to_password(self, token):
+        """Convert a token to a Phyn password"""
         b64hex = base64.b64decode((token + '=' * (5 - (len(token) % 4))).replace('_','/').replace('-','+')).hex()
 
         try:
             keydata = binascii.hexlify(base64.b64decode(self._mobile_data['partner']['comm_id'])).decode()
-        except:
-            raise Exception("Error getting password decryption key")
+        except Exception as e:
+            raise Exception("Error getting password decryption key") from e
 
         key = keydata[32:]
         iv = b64hex[18:(18+32)]
