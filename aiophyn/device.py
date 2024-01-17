@@ -1,5 +1,5 @@
 """Define /devices endpoints."""
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Any, Callable, Optional
 
 from .const import API_BASE
 
@@ -88,7 +88,7 @@ class Device:
             "post",
             f"{API_BASE}/devices/{device_id}/sov/Close",
         )
-    
+
     async def get_away_mode(self, device_id: str) -> dict:
         """Return away mode status of a device.
 
@@ -131,6 +131,42 @@ class Device:
                 "device_id": device_id,
             }
         ]
+        return await self._request(
+            "post", f"{API_BASE}/preferences/device/{device_id}", json=data
+        )
+
+    async def get_latest_firmware_info(self, device_id: str) -> dict:
+        """Get Latest Firmware Information
+
+        :param device_id: Unique identifier for the device
+        :type device_id: str
+        :return: Returns dict with fw_img_name, fw_version, product_code
+        :rtype: dict
+        """
+        return await self._request(
+            "get", f"{API_BASE}/firmware/latestVersion/v2?device_id={device_id}"
+        )
+    
+    async def get_device_preferences(self, device_id: str) -> dict:
+        """Get phyn device preferences.
+
+        :param device_id: Unique identifier for the device
+        :type device_id: str
+        :return: List of dicts with the following keys: created_ts, device_id, name, updated_ts, value
+        :rtype: dict
+        """
+        return await self._request(
+            "get", f"{API_BASE}/preferences/device/{device_id}"
+        )
+    
+    async def set_device_preferences(self, device_id: str, data: list[dict]) -> None:
+        """Set device preferences
+
+        :param device_id: Unique identifier for the device
+        :type device_id: str
+        :param data: List of dicts which have the keys: device_id, name, value
+        :type data: List[dict]
+        """
         return await self._request(
             "post", f"{API_BASE}/preferences/device/{device_id}", json=data
         )

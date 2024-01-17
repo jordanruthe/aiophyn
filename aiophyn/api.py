@@ -2,9 +2,8 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional
-from urllib.parse import urlparse
 
 import boto3
 from aiohttp import ClientSession, ClientTimeout
@@ -16,8 +15,6 @@ from .mqtt import MQTTClient
 from .device import Device
 from .errors import BrandError, RequestError
 from .home import Home
-
-from .const import API_BASE
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,7 +46,8 @@ class API:
 
     def __init__(
         self, username: str, password: str, *, phyn_brand: str, session: Optional[ClientSession] = None,
-        client_id: Optional[str] = None, verify_ssl: bool = True, proxy: Optional[str] = None, proxy_port: Optional[int] = None
+        client_id: Optional[str] = None, verify_ssl: bool = True, proxy: Optional[str] = None,
+        proxy_port: Optional[int] = None
     ) -> None:
         """Initialize."""
         if phyn_brand not in BRANDS:
@@ -75,13 +73,16 @@ class API:
         self._iot_id = None
         self._iot_credentials = None
         self.mqtt = None
+        self._id_token = None
+        self._refresh_token = None
+        self._mqtt_settings = {}
 
         self.verify_ssl = verify_ssl
         self.proxy = proxy
         self.proxy_port = proxy_port
         self.proxy_url: Optional[str] = None
         if self.proxy is not None and self.proxy_port is not None:
-            self.proxy_url = "https://%s:%s" % (proxy, proxy_port)
+            self.proxy_url = f"https://{proxy}:{proxy_port}"
 
         self._token: Optional[str] = None
         self._token_expiration: Optional[datetime] = None
@@ -90,8 +91,24 @@ class API:
         self.device: Device = Device(self._request)
         self.mqtt = MQTTClient(self, client_id=client_id, verify_ssl=verify_ssl, proxy=proxy, proxy_port=proxy_port)
 
+    @property
+    def username(self) -> Optional[str]:
+        """Get the API username"""
+        return self._username
+
     async def _request(self, method: str, url: str, token_type:str = "access", **kwargs) -> dict:
-        """Make a request against the API."""
+        """Make a request against the API.
+
+        :param method: GET or POST request
+        :type method: str
+        :param url: API URL
+        :type url: str
+        :param token_type: ID or Access token, defaults to "access"
+        :type token_type: str, optional
+        :raises RequestError: Error if issue accessing URL
+        :return: JSON response
+        :rtype: dict
+        """
         if self._token_expiration and datetime.now() >= self._token_expiration:
             _LOGGER.info("Requesting new access token to replace expired one")
 
@@ -122,10 +139,10 @@ class API:
         elif token_type == "id":
             if self._id_token:
                 kwargs["headers"]["Authorization"] = self._id_token
-        
+
         if self.proxy_url is not None:
             kwargs["proxy"] = self.proxy_url
-        
+
         if not self.verify_ssl:
             kwargs["ssl"] = False
 
@@ -150,9 +167,9 @@ class API:
     async def async_authenticate(self) -> None:
         """Authenticate the user and set the access token with its expiration."""
         if self._brand == BRANDS["kohler"]:
-            if self._password == None:
+            if self._password is None:
                 _LOGGER.info("Auhenticating to Kohler")
-                self._partner_api = KOHLER_API(self._username, self._partner_password, verify_ssl=self.verify_ssl, 
+                self._partner_api = KOHLER_API(self._username, self._partner_password, verify_ssl=self.verify_ssl,
                                                proxy=self.proxy, proxy_port=self.proxy_port)
                 await self._partner_api.authenticate()
                 self._password = self._partner_api.get_phyn_password()
@@ -190,7 +207,8 @@ class API:
 
 async def async_get_api(
     username: str, password: str, *, phyn_brand: str = "phyn", session: Optional[ClientSession] = None,
-    client_id: Optional[str] = None, verify_ssl: bool = True, proxy: Optional[str] = None, proxy_port: Optional[int] = None
+    client_id: Optional[str] = None, verify_ssl: bool = True, proxy: Optional[str] = None,
+    proxy_port: Optional[int] = None
 ) -> API:
     """Instantiate an authenticated API object.
 
@@ -202,8 +220,17 @@ async def async_get_api(
     :type password: ``str``
     :param phyn_brand: A brand for phyn
     :type phyn_brand: ``str``
+    :param client_id: A MQTT client id name
+    :type client_id: ``str``
+    :param verify_ssl: Should SSL certificates be verified
+    :type verify_ssl: ``bool``
+    :param proxy: HTTP proxy hostname/IP
+    :type proxy: ``str``
+    :param proxy_port: Port for HTTP proxy
+    :type proxy_port: ``int``
     :rtype: :meth:`aiophyn.api.API`
     """
-    api = API(username, password, phyn_brand=phyn_brand, session=session, client_id=client_id, verify_ssl=verify_ssl, proxy=proxy, proxy_port=proxy_port)
+    api = API(username, password, phyn_brand=phyn_brand, session=session, client_id=client_id,
+              verify_ssl=verify_ssl, proxy=proxy, proxy_port=proxy_port)
     await api.async_authenticate()
     return api

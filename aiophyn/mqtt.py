@@ -114,7 +114,7 @@ class MQTTClient:
         self.connect_task = None
         self.disconnect_evt: Optional[asyncio.Event] = None
         self.reconnect_evt: asyncio.Event = asyncio.Event()
-        self.host = None
+        self.host = None 
         self.port = 443
 
         if client_id is None:
@@ -326,7 +326,7 @@ class MQTTClient:
     ) -> None:
         # pylint: disable=unused-argument
         msg = message.payload.decode()
-        _LOGGER.debug("Message received on %s %s", message.topic, msg)
+        _LOGGER.debug("Message received on %s", message.topic)
         try:
             data = json.loads(msg)
         except json.decoder.JSONDecodeError:
