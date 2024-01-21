@@ -65,6 +65,27 @@ class Device:
             "get", f"{API_BASE}/devices/{device_id}/consumption/details", params=params
         )
 
+    async def get_water_statistics(self, device_id: str, from_ts, to_ts):
+        """Get statistics about a PW1 sensor
+
+        :param device_id: Unique identifier for the device
+        :type device_id: str
+        :param from_ts: Lower bound timestamp. This is a timestamp with thousands as integer
+        :type from_ts: int
+        :param to_ts: Upper bound timestamp. This is a timestamp with thousands as integer
+        :type to_ts: int
+        :return: List of dictionaries of results. 
+        :rtype: List[dict[str, Any]]
+        """
+        params = {
+            "from_ts": from_ts,
+            "to_ts": to_ts
+        }
+
+        return await self._request(
+            "get", f"{API_BASE}/devices/{device_id}/water_statistics/history/", params=params
+        )
+
     async def open_valve(self, device_id: str) -> None:
         """Open a device shutoff valve.
 
