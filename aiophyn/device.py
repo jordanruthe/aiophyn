@@ -167,7 +167,7 @@ class Device:
         return await self._request(
             "get", f"{API_BASE}/firmware/latestVersion/v2?device_id={device_id}"
         )
-    
+
     async def get_device_preferences(self, device_id: str) -> dict:
         """Get phyn device preferences.
 
@@ -179,7 +179,23 @@ class Device:
         return await self._request(
             "get", f"{API_BASE}/preferences/device/{device_id}"
         )
-    
+
+    async def run_leak_test(self, device_id: str, extended_test: bool = False):
+        """Run a leak test
+
+        :param device_id: Unique identifier for the device
+        :type device_id: str
+        :param extended_test: True if the test be extended, defaults to False
+        :type extended_test: bool, optional
+        """
+        data = {
+            "initiator": "App",
+            "test_duration": "e" if extended_test is True else "s"
+        }
+        return await self._request(
+            "post", f"{API_BASE}/devices/{device_id}/health_tests", json=data
+        )
+
     async def set_device_preferences(self, device_id: str, data: list[dict]) -> None:
         """Set device preferences
 
