@@ -154,7 +154,8 @@ class MQTTClient:
         self.client.ws_set_options(path, headers={'Host': self.host})
 
         if self.verify_ssl:
-            self.client.tls_set()
+            context = ssl.SSLContext()
+            self.client.tls_set_context(context)
         else:
             context = ssl.SSLContext()
             context.verify_mode = ssl.CERT_NONE
@@ -326,7 +327,7 @@ class MQTTClient:
     ) -> None:
         # pylint: disable=unused-argument
         msg = message.payload.decode()
-        _LOGGER.debug("Message received on %s", message.topic)
+        _LOGGER.debug("Message received on %s: %s", message.topic, msg)
         try:
             data = json.loads(msg)
         except json.decoder.JSONDecodeError:
