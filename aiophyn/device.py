@@ -155,18 +155,19 @@ class Device:
         return await self._request(
             "post", f"{API_BASE}/preferences/device/{device_id}", json=data
         )
-
-    async def get_latest_firmware_info(self, device_id: str) -> dict:
-        """Get Latest Firmware Information
+    
+    async def get_autoshuftoff_status(self, device_id: str) -> dict:
+        """Get phyn device preferences.
 
         :param device_id: Unique identifier for the device
         :type device_id: str
-        :return: Returns dict with fw_img_name, fw_version, product_code
+        :return: List of dicts with the following keys: created_ts, device_id, name, updated_ts, value
         :rtype: dict
         """
         return await self._request(
-            "get", f"{API_BASE}/firmware/latestVersion/v2?device_id={device_id}"
+            "get", f"{API_BASE}/devices/{device_id}/auto_shutoff"
         )
+    
 
     async def get_device_preferences(self, device_id: str) -> dict:
         """Get phyn device preferences.
@@ -178,6 +179,30 @@ class Device:
         """
         return await self._request(
             "get", f"{API_BASE}/preferences/device/{device_id}"
+        )
+    
+    async def get_health_tests(self, device_id: str) -> dict:
+        """Get phyn device preferences.
+
+        :param device_id: Unique identifier for the device
+        :type device_id: str
+        :return: List of dicts with the following keys
+        :rtype: dict
+        """
+        return await self._request(
+            "get", f"{API_BASE}/devices/{device_id}/health_tests?list_type=grouped"
+        )
+    
+    async def get_latest_firmware_info(self, device_id: str) -> dict:
+        """Get Latest Firmware Information
+
+        :param device_id: Unique identifier for the device
+        :type device_id: str
+        :return: Returns dict with fw_img_name, fw_version, product_code
+        :rtype: dict
+        """
+        return await self._request(
+            "get", f"{API_BASE}/firmware/latestVersion/v2?device_id={device_id}"
         )
 
     async def run_leak_test(self, device_id: str, extended_test: bool = False):
@@ -194,6 +219,29 @@ class Device:
         }
         return await self._request(
             "post", f"{API_BASE}/devices/{device_id}/health_tests", json=data
+        )
+
+    async def set_autoshutoff_enabled(self, device_id: str, shutoff_on: bool, time: int | None = None) -> None:
+        """Set autoshutoff enabled
+
+        :param device_id: Unique identifier for the device
+        :type device_id: str
+        :param shutoff_on: Turn autoshutoff on (True) or off (False). If false, also turn off for amount of time
+        :type shutoff_on: bool
+        :param time: Time for shutoff in seconds if disabling (30, 3600, 21600, 86400), or blank for indefinite
+        :type time: int | None
+        :param data: List of dicts which have the keys: device_id, name, value
+        :type data: List[dict]
+        """
+        url = f"{API_BASE}/devices/{device_id}/auto_shutoff/status/"
+        if shutoff_on == True:
+            url += "Enable"
+        else:
+            url += "Disable"
+            if time != None:
+                url += "/%s" % time
+        return await self._request(
+            "post", url
         )
 
     async def set_device_preferences(self, device_id: str, data: list[dict]) -> None:
