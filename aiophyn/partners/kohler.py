@@ -62,7 +62,7 @@ class KOHLER_API:
         """Authenticate with Kohler and Phyn"""
         use_running_session = self._session and not self._session.closed
         if not use_running_session:
-            self._session = ClientSession(timeout=ClientTimeout(total=DEFAULT_TIMEOUT), cookie_jar=CookieJar())
+            self._session = ClientSession(timeout=ClientTimeout(total=DEFAULT_TIMEOUT), cookie_jar=CookieJar(quote_cookie=False))
 
         await self.b2c_login()
         token = await self.get_phyn_token()
@@ -120,6 +120,9 @@ class KOHLER_API:
         resp = await self._session.get("https://konnectkohler.b2clogin.com/konnectkohler.onmicrosoft.com/" +
                                        "B2C_1A_signin/api/CombinedSigninAndSignup/confirmed?" + args,
                                        allow_redirects=False, ssl=self.ssl, proxy=self.proxy_url)
+        
+        if 'Location' not in resp.headers:
+            raise Exception("Unable to login to Kohler")
         matches = re.search(r'code=([^&]+)', resp.headers['Location'])
         code = matches.group(1)
 
