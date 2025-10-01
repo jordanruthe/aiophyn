@@ -1,8 +1,11 @@
-[tool.poetry]
+[project]
 name = "aiophyn"
-version = "2025.6.1"
+version = "2025.10.1"
 description = "An asynchronous library for Phyn Smart Water devices"
-authors = ["MizterB <5458030+MizterB@users.noreply.github.com>","jordanruthe <31575189+jordanruthe@users.noreply.github.com>"]
+authors = [ 
+    { name="MizterB", email="5458030+MizterB@users.noreply.github.com" },
+    { name="jordanruthe", email="31575189+jordanruthe@users.noreply.github.com" },
+]
 license = "MIT"
 readme = "README.md"
 
@@ -19,3 +22,7 @@ black = "^22.12.0"
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[project.urls]
+Homepage = "https://github.com/jordanruthe/aiophyn"
+Issues = "https://github.com/jordanruthe/aiophyn/issues"
