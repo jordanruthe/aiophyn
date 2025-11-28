@@ -242,7 +242,7 @@ class MQTTClient:
         if self.disconnect_evt is not None:
             self.disconnect_evt.set()
             _LOGGER.info("Client disconnected, not attempting to reconnect")
-        elif self.is_connected():
+        elif not self.is_connected():
             # The server connection was dropped, attempt to reconnect
             _LOGGER.info("MQTT Server Disconnected, reason: %s", paho_mqtt.error_string(reason_code))
             self.reconnect_timer.cancel()
