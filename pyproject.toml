@@ -1,6 +1,6 @@
 [project]
 name = "aiophyn"
-version = "2025.10.1"
+version = "2025.11.1"
 description = "An asynchronous library for Phyn Smart Water devices"
 authors = [ 
     { name="MizterB", email="5458030+MizterB@users.noreply.github.com" },
