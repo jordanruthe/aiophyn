@@ -11,6 +11,7 @@ from aiohttp.client_exceptions import ClientError
 from pycognito.aws_srp import AWSSRP
 
 from .partners import KOHLER_API
+from .alert import Alert
 from .mqtt import MQTTClient
 from .device import Device
 from .errors import BrandError, RequestError
@@ -87,6 +88,7 @@ class API:
         self._token: Optional[str] = None
         self._token_expiration: Optional[datetime] = None
 
+        self.alert: Alert = Alert(self._request)
         self.home: Home = Home(self._request)
         self.device: Device = Device(self._request)
         self.mqtt = MQTTClient(self, client_id=client_id, verify_ssl=verify_ssl, proxy=proxy, proxy_port=proxy_port)

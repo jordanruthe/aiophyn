@@ -1,0 +1,10 @@
+# Copy this file to config.py and fill in your values.
+# config.py is gitignored 
+
+USERNAME = "your_email@example.com"
+PASSWORD = "your_password"
+BRAND = "phyn"  # "phyn" or "kohler"
+
+# Optional: HTTP proxy settings. Set to None to disable.
+PROXY = None        # e.g. "192.168.1.1" or "proxy.example.com"
+PROXY_PORT = None   # e.g. 8080

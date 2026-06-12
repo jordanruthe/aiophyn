@@ -1,18 +1,17 @@
 """Run an example script to quickly test."""
 import asyncio
 import logging
-from datetime import date
-
-from aiohttp import ClientSession
 
 from aiophyn import async_get_api
 from aiophyn.errors import PhynError
 
+try:
+    from config import USERNAME, PASSWORD, BRAND, PROXY, PROXY_PORT
+except ImportError:
+    raise SystemExit("Copy examples/config.example to examples/config.py and fill in your credentials.")
+
 _LOGGER = logging.getLogger()
 
-USERNAME = "USERNAME_HERE"
-PASSWORD = "PASSWORD_HERE"
-BRAND = "phyn" # phyn or kohler
 
 async def on_message(device_id, data):
     """Display a received MQTT message"""
@@ -22,7 +21,12 @@ async def main() -> None:
     """Create the aiohttp session and run the example."""
     logging.basicConfig(level=logging.INFO)
     try:
-        api = await async_get_api(USERNAME, PASSWORD, phyn_brand=BRAND)
+        api = await async_get_api(
+            USERNAME, PASSWORD,
+            phyn_brand=BRAND,
+            proxy=PROXY,
+            proxy_port=PROXY_PORT,
+        )
 
         all_home_info = await api.home.get_homes(USERNAME)
         _LOGGER.info(all_home_info)

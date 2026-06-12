@@ -8,11 +8,12 @@ from aiohttp import ClientSession
 from aiophyn import async_get_api
 from aiophyn.errors import PhynError
 
-_LOGGER = logging.getLogger()
+try:
+    from config import USERNAME, PASSWORD, BRAND, PROXY, PROXY_PORT
+except ImportError:
+    raise SystemExit("Copy examples/config.example to examples/config.py and fill in your credentials.")
 
-USERNAME = "USERNAME_HERE"
-PASSWORD = "PASSWORD_HERE"
-BRAND = "BRAND" # phyn or kohler
+_LOGGER = logging.getLogger()
 
 
 async def main() -> None:
@@ -20,7 +21,13 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     async with ClientSession() as session:
         try:
-            api = await async_get_api(USERNAME, PASSWORD, phyn_brand=BRAND, session=session)
+            api = await async_get_api(
+                USERNAME, PASSWORD,
+                phyn_brand=BRAND,
+                session=session,
+                proxy=PROXY,
+                proxy_port=PROXY_PORT,
+            )
 
             all_home_info = await api.home.get_homes(USERNAME)
             _LOGGER.info(all_home_info)
