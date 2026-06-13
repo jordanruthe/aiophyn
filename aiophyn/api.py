@@ -10,28 +10,19 @@ from aiohttp import ClientSession, ClientTimeout
 from aiohttp.client_exceptions import ClientError
 from pycognito.aws_srp import AWSSRP
 
-from .partners import KOHLER_API
 from .alert import Alert
 from .mqtt import MQTTClient
 from .device import Device
-from .errors import BrandError, RequestError
+from .errors import RequestError
 from .home import Home
 
 
 _LOGGER = logging.getLogger(__name__)
 
-BRANDS = {
-    'phyn': 0,
-    'kohler': 1,
-}
-
 DEFAULT_HEADER_CONTENT_TYPE: str = "application/json"
 DEFAULT_HEADER_USER_AGENT: str = "phyn/18 CFNetwork/1331.0.7 Darwin/21.4.0"
 DEFAULT_HEADER_CONNECTION: str = "keep-alive"
-DEFAULT_HEADER_API_KEY: list[str] = [
-    "E7nfOgW6VI64fYpifiZSr6Me5w1Upe155zbu4lq8",
-    "OOLFiYu7Ts5RKI4BV6WeI3zb38HU76vZ8x5lFX6Y",
-]
+DEFAULT_HEADER_API_KEY: str = "E7nfOgW6VI64fYpifiZSr6Me5w1Upe155zbu4lq8"
 DEFAULT_HEADER_ACCEPT: str = "application/json"
 DEFAULT_HEADER_ACCEPT_ENCODING: str = "gzip, deflate, br"
 
@@ -46,29 +37,18 @@ class API:
     """Define the API object."""
 
     def __init__(
-        self, username: str, password: str, *, phyn_brand: str, session: Optional[ClientSession] = None,
+        self, username: str, password: str, *, phyn_brand: str = "phyn", session: Optional[ClientSession] = None,
         client_id: Optional[str] = None, verify_ssl: bool = True, proxy: Optional[str] = None,
         proxy_port: Optional[int] = None
     ) -> None:
         """Initialize."""
-        if phyn_brand not in BRANDS:
-            raise BrandError("Invalid phyn brand")
-
-        self._brand: str = BRANDS[phyn_brand]
-
         self._username: str = username
-        if self._brand != BRANDS['phyn']:
-            self._password: str = None
-            self._partner_api = None
-            self._partner_password: str = password
-            self._cognito: dict[str] = None
-        else:
-            self._password: str = password
-            self._cognito: dict[str] = {
-                "app_client_id": COGNITO_CLIENT_ID,
-                "pool_id": COGNITO_POOL_ID,
-                "region": COGNITO_REGION,
-            }
+        self._password: str = password
+        self._cognito: dict[str] = {
+            "app_client_id": COGNITO_CLIENT_ID,
+            "pool_id": COGNITO_POOL_ID,
+            "region": COGNITO_REGION,
+        }
 
         self._session: ClientSession = session
         self._iot_id = None
@@ -76,7 +56,6 @@ class API:
         self.mqtt = None
         self._id_token = None
         self._refresh_token = None
-        self._mqtt_settings = {}
 
         self.verify_ssl = verify_ssl
         self.proxy = proxy
@@ -129,7 +108,7 @@ class API:
                 "Content-Type": DEFAULT_HEADER_CONTENT_TYPE,
                 "User-Agent": DEFAULT_HEADER_USER_AGENT,
                 "Connection": DEFAULT_HEADER_CONNECTION,
-                "x-api-key": DEFAULT_HEADER_API_KEY[self._brand],
+                "x-api-key": DEFAULT_HEADER_API_KEY,
                 "Accept": DEFAULT_HEADER_ACCEPT,
                 "Accept-Encoding": DEFAULT_HEADER_ACCEPT_ENCODING,
             }
@@ -168,16 +147,6 @@ class API:
 
     async def async_authenticate(self) -> None:
         """Authenticate the user and set the access token with its expiration."""
-        if self._brand == BRANDS["kohler"]:
-            if self._password is None:
-                _LOGGER.info("Auhenticating to Kohler")
-                self._partner_api = KOHLER_API(self._username, self._partner_password, verify_ssl=self.verify_ssl,
-                                               proxy=self.proxy, proxy_port=self.proxy_port)
-                await self._partner_api.authenticate()
-                self._password = self._partner_api.get_phyn_password()
-                self._cognito = self._partner_api.get_cognito_info()
-                self._mqtt_settings = self._partner_api.get_mqtt_info()
-
         executor = ThreadPoolExecutor()
         future = executor.submit(self._authenticate)
         auth_response = await asyncio.wrap_future(future)
@@ -220,7 +189,7 @@ async def async_get_api(
     :type email: ``str``
     :param password: A Phyn password
     :type password: ``str``
-    :param phyn_brand: A brand for phyn
+    :param phyn_brand: Deprecated; accepted for backward compatibility but ignored.
     :type phyn_brand: ``str``
     :param client_id: A MQTT client id name
     :type client_id: ``str``
