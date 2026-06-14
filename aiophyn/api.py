@@ -7,13 +7,14 @@ from typing import Optional
 
 import boto3
 from aiohttp import ClientSession, ClientTimeout
-from aiohttp.client_exceptions import ClientError
+from aiohttp.client_exceptions import ClientError, ClientResponseError
+from botocore.exceptions import ClientError as BotocoreClientError
 from pycognito.aws_srp import AWSSRP
 
 from .alert import Alert
 from .mqtt import MQTTClient
 from .device import Device
-from .errors import RequestError
+from .errors import AuthenticationError, RequestError
 from .home import Home
 
 
@@ -77,7 +78,7 @@ class API:
         """Get the API username"""
         return self._username
 
-    async def _request(self, method: str, url: str, token_type:str = "access", **kwargs) -> dict:
+    async def _request(self, method: str, url: str, token_type: str = "access", _auth_retry: bool = True, **kwargs) -> dict:
         """Make a request against the API.
 
         :param method: GET or POST request
@@ -136,34 +137,72 @@ class API:
 
         try:
             async with session.request(method, url, **kwargs) as resp:
-                data: dict = await resp.json(content_type=None)
                 resp.raise_for_status()
+                data: dict = await resp.json(content_type=None)
                 return data
+        except ClientResponseError as err:
+            if err.status in (401, 403) and _auth_retry:
+                _LOGGER.info("Got %s; re-authenticating and retrying request", err.status)
+                await self.async_authenticate()
+                return await self._request(method, url, token_type, _auth_retry=False, **kwargs)
+            if err.status in (401, 403):
+                raise AuthenticationError(f"Unauthorized requesting {url}") from err
+            raise RequestError(f"There was an error while requesting {url}") from err
         except ClientError as err:
             raise RequestError(f"There was an error while requesting {url}") from err
         finally:
             if not use_running_session:
                 await session.close()
 
-    async def async_authenticate(self) -> None:
-        """Authenticate the user and set the access token with its expiration."""
-        executor = ThreadPoolExecutor()
-        future = executor.submit(self._authenticate)
-        auth_response = await asyncio.wrap_future(future)
+    async def _run_blocking(self, fn):
+        """Run a blocking function in a thread pool executor."""
+        return await asyncio.wrap_future(ThreadPoolExecutor().submit(fn))
 
-        access_token = auth_response["AuthenticationResult"]["AccessToken"]
-        expires_in = auth_response["AuthenticationResult"]["ExpiresIn"]
-        id_token = auth_response["AuthenticationResult"]["IdToken"]
-        refresh_token = auth_response["AuthenticationResult"]["RefreshToken"]
+    def _apply_auth_result(self, auth_response: dict) -> None:
+        """Apply an AuthenticationResult dict to the instance token state."""
+        res = auth_response["AuthenticationResult"]
+        self._token = res["AccessToken"]
+        self._token_expiration = datetime.now() + timedelta(seconds=res["ExpiresIn"])
+        self._id_token = res["IdToken"]
+        # REFRESH_TOKEN_AUTH does not return a new RefreshToken; keep the existing one.
+        if "RefreshToken" in res:
+            self._refresh_token = res["RefreshToken"]
 
-        self._token = access_token
-        self._token_expiration = datetime.now() + timedelta(seconds=expires_in)
-        self._id_token = id_token
-        self._refresh_token = refresh_token
+    async def async_authenticate(self, *, allow_refresh: bool = True) -> None:
+        """Authenticate the user and set the access token with its expiration.
 
-    def _authenticate(self):
-        """boto3 is synchronous, so authenticate in a separate thread."""
-        _LOGGER.info("Requesting token from AWS")
+        Prefers the Cognito REFRESH_TOKEN_AUTH flow when a refresh token is available,
+        falling back to the full SRP login if the refresh token is expired or missing.
+        """
+        if allow_refresh and self._refresh_token:
+            try:
+                _LOGGER.info("Refreshing access token via refresh token")
+                self._apply_auth_result(await self._run_blocking(self._refresh_token_auth))
+                return
+            except BotocoreClientError as err:
+                _LOGGER.warning(
+                    "Refresh-token auth failed (%s); falling back to SRP login",
+                    err.response["Error"]["Code"],
+                )
+                self._refresh_token = None
+
+        try:
+            _LOGGER.info("Requesting token from AWS via SRP")
+            self._apply_auth_result(await self._run_blocking(self._authenticate))
+        except BotocoreClientError as err:
+            raise AuthenticationError("Unable to authenticate with Phyn") from err
+
+    def _refresh_token_auth(self) -> dict:
+        """Use a Cognito refresh token to obtain a new access token (synchronous)."""
+        client = boto3.client("cognito-idp", region_name=self._cognito['region'])
+        return client.initiate_auth(
+            ClientId=self._cognito['app_client_id'],
+            AuthFlow="REFRESH_TOKEN_AUTH",
+            AuthParameters={"REFRESH_TOKEN": self._refresh_token},
+        )
+
+    def _authenticate(self) -> dict:
+        """Full SRP authentication (synchronous, runs in a thread pool executor)."""
         client = boto3.client("cognito-idp", region_name=self._cognito['region'])
         aws = AWSSRP(
             username=self._username,
@@ -172,8 +211,7 @@ class API:
             client_id=self._cognito['app_client_id'],
             client=client,
         )
-        auth_response = aws.authenticate_user()
-        return auth_response
+        return aws.authenticate_user()
 
 
 async def async_get_api(

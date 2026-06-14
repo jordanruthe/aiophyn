@@ -12,6 +12,13 @@ class RequestError(PhynError):
 
     ...
 
+
+class AuthenticationError(PhynError):
+    """Raised when (re-)authentication fails or a request stays unauthorized."""
+
+    ...
+
+
 class BrandError(Exception):
     """ Define an error related to invalid brands."""
 
