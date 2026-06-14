@@ -194,8 +194,8 @@ class MQTTClient:
         user_id = urllib.parse.quote_plus(self.api.username)
         try:
             wss_data = await self.api._request("post", f"{API_BASE}/users/{user_id}/iot_policy", token_type="id")
-        except:
-            Exception("Could not get WebSocket/MQTT url from API")
+        except Exception as err:
+            raise Exception("Could not get WebSocket/MQTT url from API") from err
 
         match = re.match(r'wss:\/\/([a-zA-Z0-9\.\-]+)(\/mqtt?.*)', wss_data['wss_url'])
         if not match:
@@ -246,7 +246,7 @@ class MQTTClient:
             # The server connection was dropped, attempt to reconnect
             _LOGGER.info("MQTT Server Disconnected, reason: %s", paho_mqtt.error_string(reason_code))
             self.reconnect_timer.cancel()
-            if self.connect_task is None:
+            if self.connect_task is None or self.connect_task.done():
                 self.connect_task = asyncio.create_task(self._do_reconnect(True))
         self.connect_evt.clear()
 
@@ -255,13 +255,16 @@ class MQTTClient:
         return self.client.is_connected()
 
     async def _process_reconnect(self):
-        #self.connect_task = True
         _LOGGER.info("Processing reconnect request")
 
         self.disconnect_evt = asyncio.Event()
         if self.is_connected():
             self.client.disconnect()
             await self.disconnect_evt.wait()
+        # Clear the intentional-disconnect marker before starting the
+        # reconnect loop, so that any unexpected drop during reconnection
+        # is treated as unintentional (i.e. triggers another reconnect).
+        self.disconnect_evt = None
 
         self.connect_task = asyncio.create_task(self._do_reconnect(True))
 
@@ -275,52 +278,54 @@ class MQTTClient:
         last_err: Exception = Exception()
         connect_attempts = 0
         t: float = 2.
-        while True:
-            if not first:
+        try:
+            while True:
+                if not first:
+                    try:
+                        if connect_attempts > 6:
+                            t = 60.
+                        elif connect_attempts > 3:
+                            t = 10.
+                        _LOGGER.debug("MQTT throttle for %s seconds", t)
+                        await asyncio.sleep(t)
+                    except asyncio.CancelledError:
+                        raise
+                first = False
+                connect_attempts += 1
                 try:
-                    if connect_attempts > 6:
-                        t = 60.
-                    elif connect_attempts > 3:
-                        t = 10.
-                    _LOGGER.debug("MQTT throttle for %s seconds", t)
-                    await asyncio.sleep(t)
+                    self.host, path = await self.get_mqtt_info()
+                    self.client.ws_set_options(path, headers={'Host': self.host})
+                    _LOGGER.info("Attempting to reconnnect...")
+                    await self.event_loop.run_in_executor(
+                            None,
+                            self.client.connect,
+                            self.host,
+                            self.port,
+                        )
+
+                    await asyncio.wait_for(self.connect_evt.wait(), timeout=2.)
+                    if not self.connect_evt.is_set():
+                        _LOGGER.info("Timeout while waiting for MQTT connection")
+                        continue
+
+                    # Re-subscribe to all topics
+                    topics = list(set(self.topics))
+                    tasks = [self.subscribe(topic) for topic in topics]
+                    await asyncio.gather(*tasks)
                 except asyncio.CancelledError:
-                    self.reconnect_evt.clear()
                     raise
-            first = False
-            connect_attempts += 1
-            try:
-                self.host, path = await self.get_mqtt_info()
-                self.client.ws_set_options(path, headers={'Host': self.host})
-                _LOGGER.info("Attempting to reconnnect...")
-                await self.event_loop.run_in_executor(
-                        None,
-                        self.client.connect,
-                        self.host,
-                        self.port,
-                    )
-
-                await asyncio.wait_for(self.connect_evt.wait(), timeout=2.)
-                if not self.connect_evt.is_set():
-                    _LOGGER.info("Timeout while waiting for MQTT connection")
+                except Exception as e:
+                    if type(last_err) is not type(e) or last_err.args != e.args:
+                        _LOGGER.warning("MQTT Connection Error")
+                        last_err = e
                     continue
-
-                # Re-subscribe to all topics
-                topics = list(set(self.topics))
-                tasks = [self.subscribe(topic) for topic in topics]
-                await asyncio.gather(*tasks)
-            except asyncio.CancelledError:
-                self.reconnect_evt.clear()
-                raise
-            except Exception as e:
-                if type(last_err) is not type(e) or last_err.args != e.args:
-                    _LOGGER.warning("MQTT Connection Error")
-                    last_err = e
-                continue
-            break
-        self.reconnect_evt.clear()
-        self.disconnect_evt = None
-        self.connect_task = None
+                break
+        finally:
+            # Always release the reconnect lock and clean up task/event state so
+            # that subsequent disconnect events can trigger a new reconnect attempt.
+            self.reconnect_evt.clear()
+            self.disconnect_evt = None
+            self.connect_task = None
 
     def _on_message(
         self, client: paho_mqtt.Client, userdata: Any, message: paho_mqtt.MQTTMessage
