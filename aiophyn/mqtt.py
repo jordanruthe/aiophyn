@@ -257,16 +257,33 @@ class MQTTClient:
     async def _process_reconnect(self):
         _LOGGER.info("Processing reconnect request")
 
+        # If a reconnect loop is already running (e.g. recovering from an
+        # unexpected drop), don't interfere — it will self-heal and re-subscribe.
+        # Restart the keepalive timer so we revisit in another hour.
+        if self.reconnect_evt.is_set():
+            _LOGGER.info("Reconnect already in progress, skipping keepalive cycle")
+            self.reconnect_timer.start(3600)
+            return
+
+        # If disconnected with no loop running, spawn a reconnect now.
+        if not self.is_connected():
+            if self.connect_task is None or self.connect_task.done():
+                _LOGGER.info("MQTT disconnected at keepalive; spawning reconnect")
+                self.connect_task = asyncio.create_task(self._do_reconnect(True))
+            return
+
+        # Connection is live and idle. Force a fresh connection to
+        # re-fetch the wss URL (which refreshes credentials) and re-subscribe.
         self.disconnect_evt = asyncio.Event()
-        if self.is_connected():
-            self.client.disconnect()
-            await self.disconnect_evt.wait()
+        self.client.disconnect()
+        await self.disconnect_evt.wait()
         # Clear the intentional-disconnect marker before starting the
         # reconnect loop, so that any unexpected drop during reconnection
         # is treated as unintentional (i.e. triggers another reconnect).
         self.disconnect_evt = None
 
-        self.connect_task = asyncio.create_task(self._do_reconnect(True))
+        if self.connect_task is None or self.connect_task.done():
+            self.connect_task = asyncio.create_task(self._do_reconnect(True))
 
     async def _do_reconnect(self, first: bool = False) -> None:
         if self.reconnect_evt.is_set():
