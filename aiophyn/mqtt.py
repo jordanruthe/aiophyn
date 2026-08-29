@@ -380,3 +380,4 @@ class MQTTClient:
             del self.pending_acks[mid]
         else:
             _LOGGER.info("Subscribed: %s %s %s", userdata, str(mid), str(granted_qos))
+
