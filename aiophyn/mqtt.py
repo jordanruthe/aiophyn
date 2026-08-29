@@ -209,6 +209,9 @@ class MQTTClient:
         _LOGGER.info("Attempting to subscribe to: %s", topic)
         res, msg_id = self.client.subscribe(topic, 0)
         self.pending_acks[msg_id] = topic
+ 
+        if topic not in self.topics:
+            self.topics.append(topic)
 
 
     def _on_connect(self,
@@ -374,7 +377,6 @@ class MQTTClient:
         # pylint: disable=unused-argument
         if mid in self.pending_acks:
             _LOGGER.info("Subscribed to: %s", self.pending_acks[mid])
-            self.topics.append(self.pending_acks[mid])
             del self.pending_acks[mid]
         else:
             _LOGGER.info("Subscribed: %s %s %s", userdata, str(mid), str(granted_qos))
