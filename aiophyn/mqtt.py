@@ -180,12 +180,41 @@ class MQTTClient:
         """Disconnect from server"""
         self.disconnect_evt = asyncio.Event()
         _LOGGER.info("MQTT client disconnecting...")
+
+        # An in-flight reconnect loop (spawned by _on_disconnect or
+        # _process_reconnect) should not keep retrying past an explicit
+        # disconnect request, and letting it run also races with the
+        # disconnect below.
+        if self.connect_task is not None and not self.connect_task.done():
+            self.connect_task.cancel()
+
+        if not self.client.is_connected():
+            # paho-mqtt only invokes on_disconnect for a socket it is
+            # actually tearing down. If we were never connected, or already
+            # dropped (e.g. mid-reconnect-loop after a real disconnect),
+            # there is nothing to wait for and on_disconnect will never
+            # fire — set the event ourselves so callers don't hang.
+            self.disconnect_evt.set()
+            return
+
         self.client.disconnect()
-    
-    async def disconnect_and_wait(self):
-        """Disconnect from server and wait"""
+
+    async def disconnect_and_wait(self, timeout: float = 10.0):
+        """Disconnect from server and wait.
+
+        Bounded by `timeout` so a caller that omits its own timeout can't
+        be left hanging on a disconnect that paho-mqtt never acks (this
+        can happen even when the socket does look connected, e.g. a dead
+        peer with no FIN yet observed).
+        """
         self.disconnect()
-        await self.disconnect_evt.wait()
+        try:
+            await asyncio.wait_for(self.disconnect_evt.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "Timed out waiting for MQTT on_disconnect callback; "
+                "proceeding as disconnected"
+            )
 
     async def get_mqtt_info(self):
         """ Gets WebSocket URL and parameters for a MQTT connection
