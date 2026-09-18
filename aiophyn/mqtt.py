@@ -25,6 +25,18 @@ _LOGGER = logging.getLogger(__name__)
 # hang described in issues #56 / #60.
 _DISCONNECT_WAIT_TIMEOUT: float = 10.0
 
+# How long to wait for a CONNACK after paho.connect() returns before treating
+# the attempt as failed. Unchanged from the previous hard-coded value; named
+# here only to distinguish it from the retry backstop below.
+_CONNACK_WATCHDOG_INTERVAL: float = 5.0
+
+# How long to wait before revisiting a connection we believe is down. This is
+# the only recovery mechanism left if a reconnect loop exits without a live
+# connection, so it must stay short -- but it is a backstop for a client that
+# is already known to be down, not a handshake timeout, so it does not need to
+# be as tight as _CONNACK_WATCHDOG_INTERVAL.
+_RECONNECT_WATCHDOG_INTERVAL: float = 60.0
+
 class AIOHelper:
     """Helper class for Asynchronous IO
 
@@ -124,15 +136,27 @@ class Timer:
         else:
             self._callback()
 
+    def _running_task(self) -> Optional[asyncio.Task]:
+        """The task currently executing, if we are on the event loop."""
+        try:
+            return asyncio.current_task()
+        except RuntimeError:
+            return None
+
     def cancel(self):
         """ Cancel a timer task """
         if self._task is not None:
-            self._task.cancel()
+            # Never cancel the task we are running inside: callbacks are
+            # invoked from _job, so self._task is the caller when cancel() or
+            # start() is reached from within the callback itself. Cancelling
+            # it there aborts the callback at its next await.
+            if self._task is not self._running_task():
+                self._task.cancel()
             self._task = None
 
     def start(self, timeout):
         """ Start a timer task """
-        if self._task is not None:
+        if self._task is not None and self._task is not self._running_task():
             self._task.cancel()
         _LOGGER.debug("Starting timer job for %s seconds", timeout)
         self._task = asyncio.create_task(self._job(timeout))
@@ -203,13 +227,25 @@ class MQTTClient:
 
         self.helper = AIOHelper(self.client)
         _LOGGER.info("Connecting to mqtt websocket: %s", self.host)
-        self.reconnect_timer.start(5)
+        self.connect_evt.clear()
         await self.event_loop.run_in_executor(
                 None,
                 self.client.connect,
                 self.host,
                 self.port,
             )
+        # Arm the CONNACK watchdog only once paho.connect() has returned.
+        # Arming it beforehand allowed _process_reconnect to fire while this
+        # connect was still in flight and start a *second* connection with the
+        # same client id; brokers that enforce unique client ids (AWS IoT)
+        # resolve that by dropping one of the two.
+        #
+        # If the CONNACK was already processed while we were awaiting the
+        # executor, _on_connect has run and armed the long keepalive interval.
+        # Arming unconditionally here would clobber that with the short
+        # watchdog and force a needless reconnect a minute later.
+        if not self.client.is_connected():
+            self.reconnect_timer.start(_CONNACK_WATCHDOG_INTERVAL)
     
     def disconnect(self):
         """Disconnect from server.
@@ -326,16 +362,30 @@ class MQTTClient:
                        properties: Optional[paho_mqtt.Properties] = None
                        ) -> None:
         # pylint: disable=unused-argument
+        self.connect_evt.clear()
+
         if self.disconnect_evt is not None:
             self.disconnect_evt.set()
             _LOGGER.info("Client disconnected, not attempting to reconnect")
-        elif not self.is_connected():
-            # The server connection was dropped, attempt to reconnect
-            _LOGGER.info("MQTT Server Disconnected, reason: %s", paho_mqtt.error_string(reason_code))
-            self.reconnect_timer.cancel()
-            if self.connect_task is None or self.connect_task.done():
-                self.connect_task = asyncio.create_task(self._do_reconnect(True))
-        self.connect_evt.clear()
+            return
+
+        # The server connection was dropped, attempt to reconnect.
+        #
+        # This must NOT be gated on self.is_connected(). paho only moves its
+        # internal state out of MQTT_CS_CONNECTED *after* this callback returns
+        # (Client._loop_rc_handle sets MQTT_CS_CONNECTION_LOST below the
+        # _do_on_disconnect call; Client._check_keepalive does not set it at
+        # all), so client.is_connected() is still True here for every
+        # unexpected drop. The previous "elif not self.is_connected()" guard
+        # therefore never matched and no reconnect was ever scheduled: the
+        # client stayed disconnected with connect_task=None and
+        # reconnect_evt=False until something reloaded it.
+        _LOGGER.info("MQTT Server Disconnected, reason: %s", paho_mqtt.error_string(reason_code))
+        # Re-arm rather than cancel: if the reconnect loop below exits without
+        # a live connection, this timer is the only thing left that can retry.
+        self.reconnect_timer.start(_RECONNECT_WATCHDOG_INTERVAL)
+        if self.connect_task is None or self.connect_task.done():
+            self.connect_task = asyncio.create_task(self._do_reconnect(True))
 
     def is_connected(self) -> bool:
         """ Checks if the client is connected """
@@ -354,6 +404,9 @@ class MQTTClient:
 
         # If disconnected with no loop running, spawn a reconnect now.
         if not self.is_connected():
+            # Re-arm first: the reconnect loop may exit without a live
+            # connection, and then this timer is the only way back.
+            self.reconnect_timer.start(_RECONNECT_WATCHDOG_INTERVAL)
             if self.connect_task is None or self.connect_task.done():
                 _LOGGER.info("MQTT disconnected at keepalive; spawning reconnect")
                 self.connect_task = asyncio.create_task(self._do_reconnect(True))
@@ -363,11 +416,26 @@ class MQTTClient:
         # re-fetch the wss URL (which refreshes credentials) and re-subscribe.
         self.disconnect_evt = asyncio.Event()
         self.client.disconnect()
-        await self.disconnect_evt.wait()
-        # Clear the intentional-disconnect marker before starting the
-        # reconnect loop, so that any unexpected drop during reconnection
-        # is treated as unintentional (i.e. triggers another reconnect).
-        self.disconnect_evt = None
+        try:
+            # Bounded, using the same constant disconnect_and_wait() uses. An
+            # unbounded wait here is the one remaining route to a permanently
+            # dead client: if the callback never arrives, disconnect_evt stays
+            # set and every later _on_disconnect takes the "not attempting to
+            # reconnect" branch forever.
+            await asyncio.wait_for(self.disconnect_evt.wait(),
+                                   timeout=_DISCONNECT_WAIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "Timed out after %ss waiting for the MQTT disconnect callback "
+                "during a keepalive refresh; reconnecting anyway",
+                _DISCONNECT_WAIT_TIMEOUT,
+            )
+        finally:
+            # Clear the intentional-disconnect marker before starting the
+            # reconnect loop, so that any unexpected drop during reconnection
+            # is treated as unintentional (i.e. triggers another reconnect).
+            # In a finally: leaving this set would disable reconnects for good.
+            self.disconnect_evt = None
 
         if self.connect_task is None or self.connect_task.done():
             self.connect_task = asyncio.create_task(self._do_reconnect(True))
@@ -400,6 +468,7 @@ class MQTTClient:
                     self.host, path = await self.get_mqtt_info()
                     self.client.ws_set_options(path, headers={'Host': self.host})
                     _LOGGER.info("Attempting to reconnnect...")
+                    self.connect_evt.clear()
                     await self.event_loop.run_in_executor(
                             None,
                             self.client.connect,
@@ -408,8 +477,12 @@ class MQTTClient:
                         )
 
                     await asyncio.wait_for(self.connect_evt.wait(), timeout=2.)
-                    if not self.connect_evt.is_set():
-                        _LOGGER.info("Timeout while waiting for MQTT connection")
+                    # connect_evt is only ever set by _on_connect. Without the
+                    # clear() above, a set left over from an earlier attempt
+                    # satisfied this wait immediately and the loop broke out
+                    # believing it had connected. Confirm against paho itself.
+                    if not self.client.is_connected():
+                        _LOGGER.info("MQTT connection not established, retrying")
                         continue
 
                     # Re-subscribe to all topics; drop acks from the old session.
@@ -430,6 +503,11 @@ class MQTTClient:
             # that subsequent disconnect events can trigger a new reconnect attempt.
             self.reconnect_evt.clear()
             self.connect_task = None
+            # Never leave the client disconnected with nothing scheduled:
+            # reconnect_evt clear + connect_task None + no timer means nothing
+            # will ever retry.
+            if not self.client.is_connected():
+                self.reconnect_timer.start(_RECONNECT_WATCHDOG_INTERVAL)
 
     def _on_message(
         self, client: paho_mqtt.Client, userdata: Any, message: paho_mqtt.MQTTMessage
