@@ -57,6 +57,7 @@ class AIOHelper:
         self.client._on_socket_unregister_write = \
             self._on_socket_unregister_write
         self.misc_task: Optional[asyncio.Task] = None
+        self.sock: Optional[socket.socket] = None
 
     def _run_on_loop(self, func, *args) -> None:
         """Run ``func`` on the event-loop thread, directly if already there."""
@@ -80,6 +81,9 @@ class AIOHelper:
 
     def _socket_open_on_loop(self, client: paho_mqtt.Client, sock: socket.socket) -> None:
         self.loop.add_reader(sock, client.loop_read)
+        # Remember which socket this misc loop belongs to, so that a later
+        # close callback for a *different* socket cannot cancel it.
+        self.sock = sock
         if self.misc_task is not None and not self.misc_task.done():
             self.misc_task.cancel()
         self.misc_task = self.loop.create_task(self.misc_loop())
@@ -91,6 +95,21 @@ class AIOHelper:
 
     def _socket_close_on_loop(self, sock: socket.socket) -> None:
         self.loop.remove_reader(sock)
+        if sock is not self.sock:
+            # remove_reader() is scoped to the socket it was handed;
+            # misc_task.cancel() was not. When two sockets overlap (open A,
+            # open B, then stale A closes), A's close cancelled B's misc loop.
+            # loop_misc() is the only caller of _check_keepalive() and the only
+            # thing sending PINGREQ, so the client would then keep reporting
+            # is_connected() with no way left to notice a dead link.
+            #
+            # Found by inspection while tracing the reconnect path, and
+            # reproduced against AIOHelper directly; I have no field capture of
+            # it, so this is offered as a latent defect rather than as the
+            # explanation for any particular report.
+            _LOGGER.debug("Ignoring close of a superseded MQTT socket")
+            return
+        self.sock = None
         if self.misc_task is not None:
             self.misc_task.cancel()
 
