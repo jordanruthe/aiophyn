@@ -8,7 +8,7 @@ from typing import Optional
 import boto3
 from aiohttp import ClientSession, ClientTimeout
 from aiohttp.client_exceptions import ClientError, ClientResponseError
-from botocore.exceptions import ClientError as BotocoreClientError
+from botocore.exceptions import BotoCoreError, ClientError as BotocoreClientError
 from pycognito.aws_srp import AWSSRP
 
 from .alert import Alert
@@ -185,12 +185,30 @@ class API:
                     err.response["Error"]["Code"],
                 )
                 self._refresh_token = None
+            except BotoCoreError as err:
+                # Transport failure rather than a token problem: Cognito was
+                # never reached, so falling through to the full SRP login
+                # would only fail the same way. Keep the refresh token.
+                raise RequestError(
+                    "Could not reach the Phyn authentication service"
+                ) from err
 
         try:
             _LOGGER.info("Requesting token from AWS via SRP")
             self._apply_auth_result(await self._run_blocking(self._authenticate))
         except BotocoreClientError as err:
             raise AuthenticationError("Unable to authenticate with Phyn") from err
+        except BotoCoreError as err:
+            # botocore splits its exceptions into two unrelated hierarchies:
+            # ClientError means the service answered with an error (bad
+            # credentials), BotoCoreError means it was never reached (DNS
+            # failure, refused connection, timeout). Only the first was
+            # handled, so a network outage escaped as a raw botocore
+            # exception and callers could not tell it apart from a genuine
+            # auth failure.
+            raise RequestError(
+                "Could not reach the Phyn authentication service"
+            ) from err
 
     def _refresh_token_auth(self) -> dict:
         """Use a Cognito refresh token to obtain a new access token (synchronous)."""
