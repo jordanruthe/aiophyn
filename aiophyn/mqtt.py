@@ -400,15 +400,44 @@ class MQTTClient:
         # client stayed disconnected with connect_task=None and
         # reconnect_evt=False until something reloaded it.
         _LOGGER.info("MQTT Server Disconnected, reason: %s", paho_mqtt.error_string(reason_code))
-        # Re-arm rather than cancel: if the reconnect loop below exits without
-        # a live connection, this timer is the only thing left that can retry.
-        self.reconnect_timer.start(_RECONNECT_WATCHDOG_INTERVAL)
-        if self.connect_task is None or self.connect_task.done():
-            self.connect_task = asyncio.create_task(self._do_reconnect(True))
+        self._spawn_reconnect()
 
     def is_connected(self) -> bool:
         """ Checks if the client is connected """
         return self.client.is_connected()
+
+    def _spawn_reconnect(self) -> None:
+        """Arm the retry backstop and start a reconnect loop if none is running.
+
+        Re-arm rather than cancel the timer: if the reconnect loop exits
+        without a live connection, this timer is the only thing left that can
+        retry.
+        """
+        self.reconnect_timer.start(_RECONNECT_WATCHDOG_INTERVAL)
+        if self.connect_task is None or self.connect_task.done():
+            self.connect_task = asyncio.create_task(self._do_reconnect(True))
+
+    def ensure_connected(self) -> bool:
+        """Nudge the client back online if it has dropped.
+
+        Intended for callers that poll ``is_connected()`` (e.g. a watchdog in
+        the Home Assistant integration) and want a cheaper recovery than
+        rebuilding the whole client. Returns ``True`` when already connected.
+        Returns ``False`` when disconnected; in that case a reconnect loop is
+        started unless one is already running or the client was disconnected
+        intentionally via ``disconnect()``.
+        """
+        if self.is_connected():
+            return True
+        if self.disconnect_evt is not None:
+            _LOGGER.debug("ensure_connected: client was disconnected intentionally; not reconnecting")
+            return False
+        if self.reconnect_evt.is_set():
+            _LOGGER.debug("ensure_connected: reconnect already in progress")
+            return False
+        _LOGGER.info("MQTT disconnected; reconnect requested by caller")
+        self._spawn_reconnect()
+        return False
 
     async def _process_reconnect(self):
         _LOGGER.info("Processing reconnect request")
@@ -423,12 +452,8 @@ class MQTTClient:
 
         # If disconnected with no loop running, spawn a reconnect now.
         if not self.is_connected():
-            # Re-arm first: the reconnect loop may exit without a live
-            # connection, and then this timer is the only way back.
-            self.reconnect_timer.start(_RECONNECT_WATCHDOG_INTERVAL)
-            if self.connect_task is None or self.connect_task.done():
-                _LOGGER.info("MQTT disconnected at keepalive; spawning reconnect")
-                self.connect_task = asyncio.create_task(self._do_reconnect(True))
+            _LOGGER.info("MQTT disconnected at keepalive; spawning reconnect")
+            self._spawn_reconnect()
             return
 
         # Connection is live and idle. Force a fresh connection to
