@@ -1,7 +1,6 @@
 """Define a base client for interacting with Phyn."""
 import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -19,6 +18,9 @@ from .home import Home
 
 
 _LOGGER = logging.getLogger(__name__)
+
+# Upper bound on a single blocking Cognito call (refresh or SRP login).
+AUTH_TIMEOUT: float = 30.0
 
 DEFAULT_HEADER_CONTENT_TYPE: str = "application/json"
 DEFAULT_HEADER_USER_AGENT: str = "phyn/18 CFNetwork/1331.0.7 Darwin/21.4.0"
@@ -155,8 +157,23 @@ class API:
                 await session.close()
 
     async def _run_blocking(self, fn):
-        """Run a blocking function in a thread pool executor."""
-        return await asyncio.wrap_future(ThreadPoolExecutor().submit(fn))
+        """Run a blocking Cognito call on the loop's default executor, bounded.
+
+        Previously each call spun up its own ThreadPoolExecutor and awaited
+        it with no timeout. If the worker never completed (issue #4) the
+        awaiting coroutine hung forever and the caller's config entry was
+        stuck with no error. The wait is now bounded and a timeout surfaces
+        as RequestError so callers treat it as transient and retry.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, fn), timeout=AUTH_TIMEOUT
+            )
+        except asyncio.TimeoutError as err:
+            raise RequestError(
+                f"Timed out after {AUTH_TIMEOUT}s waiting for the Phyn authentication service"
+            ) from err
 
     def _apply_auth_result(self, auth_response: dict) -> None:
         """Apply an AuthenticationResult dict to the instance token state."""

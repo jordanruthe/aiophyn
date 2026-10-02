@@ -224,3 +224,39 @@ class TestAuthenticateTransportErrors:
 
         with pytest.raises(AuthenticationError):
             asyncio.run(api.async_authenticate())
+
+
+# ---------------------------------------------------------------------------
+# _run_blocking — bounded wait (aiophyn #4)
+# ---------------------------------------------------------------------------
+
+import aiophyn.api as api_module
+
+
+class TestRunBlockingTimeout:
+    def test_hung_blocking_call_raises_request_error(self, monkeypatch):
+        """A Cognito call that never returns must not hang the caller forever."""
+        monkeypatch.setattr(api_module, "AUTH_TIMEOUT", 0.05)
+        api = _make_api(refresh_token=None)
+
+        import threading
+        release = threading.Event()
+
+        def hung_authenticate():
+            release.wait(2)
+            return _auth_result()
+
+        api._authenticate = hung_authenticate
+        try:
+            with pytest.raises(RequestError):
+                asyncio.run(asyncio.wait_for(api.async_authenticate(), timeout=1))
+        finally:
+            release.set()
+
+    def test_fast_blocking_call_returns_result(self):
+        api = _make_api(refresh_token=None)
+        api._authenticate = lambda: _auth_result()
+
+        asyncio.run(api.async_authenticate())
+
+        assert api._token == "new-access-token"
