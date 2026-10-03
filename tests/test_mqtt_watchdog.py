@@ -14,6 +14,9 @@ Verifies that:
 - a step that raises does not escape;
 - a SUBACK, whoever sent it, restarts the silence clock, and the resume line
   reports the SUBACK delay and the seq_num pair;
+- a device session that began after the last step restarts the steps from
+  resubscribe, also after standing down (replay of an internet outage);
+- a long outage backs off to one cloud read every 5 minutes;
 - disconnect() cancels the watchdog task.
 """
 from __future__ import annotations
@@ -245,6 +248,155 @@ class TestOfflineHold:
         with caplog.at_level(logging.DEBUG, logger="aiophyn.mqtt"):
             _run(_t())
         assert not any("secret-sid" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# New device session: start over
+# ---------------------------------------------------------------------------
+
+def _cloud(mqtt: MQTTClient, status: str, since_s: float) -> None:
+    """Make the cloud report ``status`` with a session/status start time."""
+    mqtt.api.device.get_state = AsyncMock(
+        return_value={"online_status": {"v": status, "ts": int(since_s * 1000)}}
+    )
+
+
+class TestNewSession:
+    def test_internet_outage_replay(self, caplog):
+        """Cloud still shows the old session, then offline, then a new one.
+
+        Recorded on a real PP1 with its internet blocked for 3 minutes: step 1
+        went to a device that was not there, the cloud noticed ~90 s later, and
+        the device came back with a new session. The next step must be a fresh
+        resubscribe, not step 2.
+        """
+        async def _t():
+            mqtt = _make_mqtt_client()
+            _cloud(mqtt, "online", time.time() - 3600)      # old session
+            _go_silent(mqtt)
+            await mqtt._watchdog_tick()                      # step 1, wasted
+            assert mqtt.subscribe.await_count == 1
+            _cloud(mqtt, "offline", time.time())
+            _skip_wait(mqtt)
+            await mqtt._watchdog_tick()                      # held
+            assert mqtt.subscribe.await_count == 1
+            _cloud(mqtt, "online", time.time() + 1)          # new session
+            _skip_wait(mqtt)
+            await mqtt._watchdog_tick()
+            assert mqtt.subscribe.await_count == 2
+            mqtt.client.unsubscribe.assert_not_called()      # step 1 again
+            assert mqtt._wd_step == 1
+        with caplog.at_level(logging.INFO, logger="aiophyn.mqtt"):
+            _run(_t())
+        assert any("starting over" in r.getMessage() for r in caplog.records)
+
+    def test_old_session_keeps_climbing(self):
+        async def _t():
+            mqtt = _make_mqtt_client()
+            _cloud(mqtt, "online", time.time() - 3600)
+            _go_silent(mqtt)
+            await mqtt._watchdog_tick()
+            _skip_wait(mqtt)
+            await mqtt._watchdog_tick()
+            mqtt.client.unsubscribe.assert_called_once_with(TOPIC)  # step 2
+        _run(_t())
+
+    def test_stood_down_restarts_on_new_session(self):
+        async def _t():
+            mqtt = _make_mqtt_client()
+            _cloud(mqtt, "online", time.time() - 3600)
+            _go_silent(mqtt)
+            for _ in range(4):                               # 3 steps + stand down
+                await mqtt._watchdog_tick()
+                _skip_wait(mqtt)
+            assert mqtt._wd_step == 4
+            subs = mqtt.subscribe.await_count
+            _cloud(mqtt, "online", time.time() + 1)
+            await mqtt._watchdog_tick()
+            assert mqtt.subscribe.await_count == subs + 1
+            assert mqtt.client.unsubscribe.call_count == 1   # not step 2 again
+            assert mqtt._wd_step == 1
+        _run(_t())
+
+    def test_stood_down_without_new_session_does_nothing(self):
+        async def _t():
+            mqtt = _make_mqtt_client()
+            _cloud(mqtt, "online", time.time() - 3600)
+            _go_silent(mqtt)
+            for _ in range(4):
+                await mqtt._watchdog_tick()
+                _skip_wait(mqtt)
+            subs = mqtt.subscribe.await_count
+            reads = mqtt.api.device.get_state.await_count
+            await mqtt._watchdog_tick()
+            assert mqtt.subscribe.await_count == subs
+            mqtt._process_reconnect.assert_awaited_once()
+            assert mqtt.api.device.get_state.await_count == reads + 1
+            assert mqtt._wd_next_at > time.monotonic()       # next check spaced
+        _run(_t())
+
+
+# ---------------------------------------------------------------------------
+# Cost of a long outage
+# ---------------------------------------------------------------------------
+
+class _FakeClock:
+    def __init__(self):
+        self.t = 1_000_000.0
+
+    def monotonic(self):
+        return self.t
+
+    def time(self):
+        return self.t
+
+
+class TestBackoff:
+    def test_offline_rechecks_fast_then_slow(self, monkeypatch):
+        clock = _FakeClock()
+        monkeypatch.setattr(mqtt_module, "time", clock)
+
+        async def _t():
+            mqtt = _make_mqtt_client(online="offline")
+            mqtt._wd_last_rx = mqtt._wd_last_suback = clock.t - 120
+            await mqtt._watchdog_tick()                       # first hold
+            assert mqtt._wd_next_at - clock.t == mqtt_module._SILENCE_OFFLINE_RECHECK
+            clock.t += mqtt_module._SILENCE_OFFLINE_FAST + 1
+            await mqtt._watchdog_tick()                       # past 10 minutes
+            assert mqtt._wd_next_at - clock.t == mqtt_module._SILENCE_SLOW_RECHECK
+            mqtt.subscribe.assert_not_awaited()
+        _run(_t())
+
+    def test_two_hour_outage_costs_few_cloud_reads(self, monkeypatch):
+        clock = _FakeClock()
+        monkeypatch.setattr(mqtt_module, "time", clock)
+
+        async def _t():
+            mqtt = _make_mqtt_client(online="offline")
+            mqtt._wd_last_rx = mqtt._wd_last_suback = clock.t
+            end = clock.t + 2 * 3600
+            while clock.t < end:
+                clock.t += mqtt_module._SILENCE_TICK
+                await mqtt._watchdog_tick()
+            return mqtt.api.device.get_state.await_count
+        reads = _run(_t())
+        # ~20 reads in the first 10 minutes, then one per 5 minutes.
+        assert 35 <= reads <= 45, reads
+
+    def test_stood_down_checks_every_five_minutes(self, monkeypatch):
+        clock = _FakeClock()
+        monkeypatch.setattr(mqtt_module, "time", clock)
+
+        async def _t():
+            mqtt = _make_mqtt_client()
+            _cloud(mqtt, "online", clock.t - 3600)
+            mqtt._wd_last_rx = mqtt._wd_last_suback = clock.t - 120
+            for _ in range(4):                                # 3 steps + stand down
+                await mqtt._watchdog_tick()
+                mqtt._wd_next_at = 0.0
+            await mqtt._watchdog_tick()
+            assert mqtt._wd_next_at - clock.t == mqtt_module._SILENCE_SLOW_RECHECK
+        _run(_t())
 
 
 # ---------------------------------------------------------------------------
