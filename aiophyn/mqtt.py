@@ -47,7 +47,9 @@ _SILENCE_WATCHDOG_ENABLED: bool = True
 _SILENCE_THRESHOLD: float = 30.0       # silence before the first step
 _SILENCE_STEP_SPACING: float = 60.0    # watch time after each step
 _SILENCE_TICK: float = 5.0             # how often the watchdog looks
-_SILENCE_OFFLINE_RECHECK: float = 60.0 # re-check interval while the device is offline
+_SILENCE_OFFLINE_RECHECK: float = 30.0 # re-check interval while the device is offline
+_SILENCE_OFFLINE_FAST: float = 600.0   # ...for this long; most outages end sooner
+_SILENCE_SLOW_RECHECK: float = 300.0   # then, and after standing down, every 5 min
 _SEQ_RE = re.compile(r'"seq_num"\s*:\s*(\d+)')
 
 class AIOHelper:
@@ -203,11 +205,14 @@ class MQTTClient:
     _wd_last_suback: float = 0.0
     _wd_silent: bool = False
     _wd_held: bool = False
+    _wd_held_since: float = 0.0
     _wd_last_seq: Optional[int] = None
     _wd_step: int = 0
     _wd_next_at: float = 0.0
     _wd_last_step: Optional[str] = None
     _wd_last_step_at: float = 0.0
+    _wd_last_step_wall: float = 0.0
+    _wd_device_since: Optional[float] = None
     def __init__(self, api, client_id: str =None, verify_ssl: bool =True, proxy: str =None, proxy_port: int =None):
         self.event_loop = asyncio.get_running_loop()
         self.api = api
@@ -248,11 +253,14 @@ class MQTTClient:
         self._wd_last_suback: float = now      # last SUBACK, whoever subscribed
         self._wd_silent: bool = False          # inside a detected silence
         self._wd_held: bool = False            # offline hold already logged
+        self._wd_held_since: float = 0.0       # start of the current offline hold
         self._wd_last_seq: Optional[int] = None
         self._wd_step: int = 0                 # steps already taken this silence
         self._wd_next_at: float = 0.0          # earliest time for the next step
         self._wd_last_step: Optional[str] = None
         self._wd_last_step_at: float = 0.0
+        self._wd_last_step_wall: float = 0.0   # wall clock of the last step
+        self._wd_device_since: Optional[float] = None  # cloud session start, ms
         self._wd_task: Optional[asyncio.Task] = None
 
     async def add_event_handler(self, type, target):
@@ -647,11 +655,20 @@ class MQTTClient:
     # then stand down until data flows again.  In practice the stream comes
     # back ~0.4 s after the first SUBACK that follows the device's return.
     #
+    # A step taken before the device's return cannot have reached it, so if
+    # the cloud reports a device session that began after the last step, the
+    # steps start over from 1, also after standing down.  This matters when
+    # the network fails: the cloud keeps reporting the old session as online
+    # for about 90 s, long enough for early steps to go to a device that is
+    # not there.
+    #
     # Before each step the device state is read from the Phyn cloud.  While
     # the cloud reports the device offline no step is taken (a SUBSCRIBE sent
     # before the device is back has no effect); the state is re-checked every
-    # _SILENCE_OFFLINE_RECHECK seconds instead.  If the cloud cannot be
-    # asked, the step is taken anyway.
+    # _SILENCE_OFFLINE_RECHECK seconds for the first _SILENCE_OFFLINE_FAST
+    # seconds, then every _SILENCE_SLOW_RECHECK seconds, so a long outage
+    # costs about 12 cloud reads an hour.  If the cloud cannot be asked, the
+    # step is taken anyway.
     # ------------------------------------------------------------------
 
     _WATCHDOG_STEPS = ("resubscribe", "unsubscribe+subscribe", "reconnect")
@@ -687,6 +704,7 @@ class MQTTClient:
         self._wd_last_rx = now
         self._wd_silent = False
         self._wd_held = False
+        self._wd_held_since = 0.0
         self._wd_step = 0
         self._wd_next_at = 0.0
         self._wd_last_step = None
@@ -712,11 +730,23 @@ class MQTTClient:
             _LOGGER.info("WATCHDOG could not read device state before '%s': %r", step, err)
             return None
         online = state.get("online_status") or {}
+        self._wd_device_since = (
+            online.get("ts") if online.get("v") == "online" else None
+        )
         _LOGGER.debug(
             "WATCHDOG device state before '%s': online_status=%s since %s",
             step, online.get("v"), online.get("ts"),
         )
         return online.get("v") == "online"
+
+    def _watchdog_new_session(self) -> bool:
+        """True if the device started a cloud session after the last step."""
+        since = self._wd_device_since
+        return (
+            self._wd_last_step is not None
+            and isinstance(since, (int, float))
+            and since / 1000 > self._wd_last_step_wall
+        )
 
     async def _watchdog_run_step(self, step: str) -> None:
         topics = list(set(self.topics))
@@ -753,26 +783,55 @@ class MQTTClient:
                 silent_for, now - self._wd_last_rx,
             )
 
-        if now < self._wd_next_at or self._wd_step > len(self._WATCHDOG_STEPS):
+        if now < self._wd_next_at:
             return
 
-        if self._wd_step == len(self._WATCHDOG_STEPS):
-            _LOGGER.warning(
-                "WATCHDOG stand down: %d step(s) did not restore the stream "
-                "(%.0fs since last message)",
-                self._wd_step, now - self._wd_last_rx,
+        steps = self._WATCHDOG_STEPS
+        step = steps[self._wd_step] if self._wd_step < len(steps) else None
+        online = await self._watchdog_device_online(step or "stand down")
+
+        if online and self._watchdog_new_session():
+            _LOGGER.info(
+                "WATCHDOG device started a new session after step '%s'; "
+                "starting over", self._wd_last_step,
             )
-            self._wd_step += 1
+            self._wd_step = 0
+            step = steps[0]
+
+        if step is None:
+            # All steps taken.  Stand down (logged once), but keep checking
+            # for a new device session, at the slow interval.
+            if self._wd_step == len(steps):
+                _LOGGER.warning(
+                    "WATCHDOG stand down: %d step(s) did not restore the stream "
+                    "(%.0fs since last message)",
+                    self._wd_step, now - self._wd_last_rx,
+                )
+                self._wd_step += 1
+            self._wd_next_at = time.monotonic() + _SILENCE_SLOW_RECHECK
             return
 
-        step = self._WATCHDOG_STEPS[self._wd_step]
-        if await self._watchdog_device_online(step) is False:
-            (_LOGGER.debug if self._wd_held else _LOGGER.info)(
-                "WATCHDOG holding '%s': the Phyn cloud reports the device "
-                "offline; re-checking every %.0fs", step, _SILENCE_OFFLINE_RECHECK,
-            )
+        if online is False:
+            held_now = time.monotonic()
+            if not self._wd_held_since:
+                self._wd_held_since = held_now
+            held_for = held_now - self._wd_held_since
+            interval = (_SILENCE_OFFLINE_RECHECK if held_for < _SILENCE_OFFLINE_FAST
+                        else _SILENCE_SLOW_RECHECK)
+            if not self._wd_held:
+                _LOGGER.info(
+                    "WATCHDOG holding '%s': the Phyn cloud reports the device "
+                    "offline; re-checking every %.0fs", step, interval,
+                )
+            elif interval == _SILENCE_SLOW_RECHECK and held_for - _SILENCE_OFFLINE_FAST < interval:
+                _LOGGER.info(
+                    "WATCHDOG device still offline after %.0f min; re-checking "
+                    "every %.0fs", held_for / 60, interval,
+                )
+            else:
+                _LOGGER.debug("WATCHDOG still holding '%s'", step)
             self._wd_held = True
-            self._wd_next_at = time.monotonic() + _SILENCE_OFFLINE_RECHECK
+            self._wd_next_at = held_now + interval
             return
 
         _LOGGER.info(
@@ -786,6 +845,8 @@ class MQTTClient:
             _LOGGER.warning("WATCHDOG step '%s' raised: %r", step, err)
         self._wd_last_step = step
         self._wd_last_step_at = time.monotonic()
+        self._wd_last_step_wall = time.time()
+        self._wd_held_since = 0.0
         self._wd_step += 1
         self._wd_next_at = self._wd_last_step_at + _SILENCE_STEP_SPACING
 
