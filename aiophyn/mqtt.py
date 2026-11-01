@@ -39,17 +39,19 @@ _RECONNECT_WATCHDOG_INTERVAL: float = 60.0
 
 # Silence watchdog.  A Phyn device publishes on its app_subscriptions topic
 # about every 5 s, but only while it has a live streaming session.  When the
-# device opens a new cloud session (after a Wi-Fi rejoin, a reboot, a power
-# cut) it stays silent until a client SUBSCRIBEs again, while the MQTT
-# connection itself stays healthy.  Without intervention the gap lasts until
-# the hourly keepalive reconnect.  See MQTTClient._watchdog_tick().
+# device reconnects to the Phyn cloud (Wi-Fi rejoin, reboot, power cut, or
+# just its cloud connection dropping) it stays silent until a client
+# SUBSCRIBEs again, while our own MQTT connection stays healthy.  Without
+# intervention the gap lasts until the hourly keepalive reconnect.  Silence
+# is tracked per device topic.  See MQTTClient._watchdog_tick().
 _SILENCE_WATCHDOG_ENABLED: bool = True
-_SILENCE_THRESHOLD: float = 30.0       # silence before the first step
-_SILENCE_STEP_SPACING: float = 60.0    # watch time after each step
-_SILENCE_TICK: float = 5.0             # how often the watchdog looks
-_SILENCE_OFFLINE_RECHECK: float = 30.0 # re-check interval while the device is offline
-_SILENCE_OFFLINE_FAST: float = 600.0   # ...for this long; most outages end sooner
-_SILENCE_SLOW_RECHECK: float = 300.0   # then, and after standing down, every 5 min
+_SILENCE_THRESHOLD: float = 60.0    # silence on a device topic before acting
+_SILENCE_TICK: float = 5.0          # how often the watchdog looks
+_SILENCE_RETRY: float = 60.0        # wait between checks during a silence...
+_SILENCE_FAST_PERIOD: float = 600.0 # ...for this long (most outages end sooner)
+_SILENCE_SLOW_RETRY: float = 300.0  # then every 5 min
+_SILENCE_WARN_AFTER: int = 3        # resubscribes without effect before WARNING
+_DEVICE_TOPIC_PREFIX = "prd/app_subscriptions/"
 _SEQ_RE = re.compile(r'"seq_num"\s*:\s*(\d+)')
 
 class AIOHelper:
@@ -195,24 +197,27 @@ class Timer:
         _LOGGER.debug("Starting timer job for %s seconds", timeout)
         self._task = asyncio.create_task(self._job(timeout))
 
+class _TopicWatch:
+    """Silence-watchdog state for one device topic.  Monotonic clock."""
+
+    def __init__(self, now: float) -> None:
+        self.last_rx: float = now          # last message on this topic
+        self.last_suback: float = now      # last SUBACK for this topic
+        self.last_seq: Optional[int] = None
+        self.silent: bool = False          # inside a detected silence
+        self.silent_since: float = 0.0
+        self.next_at: float = 0.0          # earliest time for the next check
+        self.offline_since: float = 0.0    # cloud reported offline since (0: not)
+        self.attempts: int = 0             # resubscribes since online again
+        self.last_attempt_at: float = 0.0
+        self.warned: bool = False
+
 class MQTTClient:
     """AIO MQTT client """
 
-    # Silence watchdog state; class-level defaults keep every code path safe
-    # on instances that never ran __init__ (as some tests construct them).
+    # Class-level default keeps the watchdog safe on instances that never
+    # ran __init__ (as some tests construct them).
     _wd_task: Optional[asyncio.Task] = None
-    _wd_last_rx: float = 0.0
-    _wd_last_suback: float = 0.0
-    _wd_silent: bool = False
-    _wd_held: bool = False
-    _wd_held_since: float = 0.0
-    _wd_last_seq: Optional[int] = None
-    _wd_step: int = 0
-    _wd_next_at: float = 0.0
-    _wd_last_step: Optional[str] = None
-    _wd_last_step_at: float = 0.0
-    _wd_last_step_wall: float = 0.0
-    _wd_device_since: Optional[float] = None
     def __init__(self, api, client_id: str =None, verify_ssl: bool =True, proxy: str =None, proxy_port: int =None):
         self.event_loop = asyncio.get_running_loop()
         self.api = api
@@ -247,20 +252,7 @@ class MQTTClient:
             "update": []
         }
 
-        # Silence watchdog state.  Monotonic clocks throughout.
-        now = time.monotonic()
-        self._wd_last_rx: float = now          # last inbound message
-        self._wd_last_suback: float = now      # last SUBACK, whoever subscribed
-        self._wd_silent: bool = False          # inside a detected silence
-        self._wd_held: bool = False            # offline hold already logged
-        self._wd_held_since: float = 0.0       # start of the current offline hold
-        self._wd_last_seq: Optional[int] = None
-        self._wd_step: int = 0                 # steps already taken this silence
-        self._wd_next_at: float = 0.0          # earliest time for the next step
-        self._wd_last_step: Optional[str] = None
-        self._wd_last_step_at: float = 0.0
-        self._wd_last_step_wall: float = 0.0   # wall clock of the last step
-        self._wd_device_since: Optional[float] = None  # cloud session start, ms
+        self._wd_topics: Dict[str, _TopicWatch] = {}
         self._wd_task: Optional[asyncio.Task] = None
 
     async def add_event_handler(self, type, target):
@@ -611,7 +603,7 @@ class MQTTClient:
         msg = message.payload.decode()
         _LOGGER.debug("Message received on %s: %s", message.topic, msg)
         seq_match = _SEQ_RE.search(msg)
-        self._watchdog_note_rx(int(seq_match.group(1)) if seq_match else None)
+        self._watchdog_note_rx(message.topic, int(seq_match.group(1)) if seq_match else None)
         try:
             data = json.loads(msg)
         except json.decoder.JSONDecodeError:
@@ -636,219 +628,198 @@ class MQTTClient:
         # pylint: disable=unused-argument
         if mid in self.pending_acks:
             _LOGGER.info("Subscribed to: %s", self.pending_acks[mid])
+            self._watchdog_note_suback(self.pending_acks[mid])
             del self.pending_acks[mid]
-            self._wd_last_suback = time.monotonic()
         else:
             _LOGGER.info("Subscribed: %s %s %s", userdata, str(mid), str(granted_qos))
 
     # ------------------------------------------------------------------
     # Silence watchdog
     #
-    # When the client is connected and subscribed but has received nothing
-    # for _SILENCE_THRESHOLD seconds, take one step at a time, each followed
-    # by _SILENCE_STEP_SPACING seconds of watching:
+    # Per device topic: when the client is connected and subscribed but the
+    # topic has been silent for _SILENCE_THRESHOLD seconds (counted from its
+    # last message or its last SUBACK, whoever subscribed), read the device
+    # state from the Phyn cloud:
     #
-    #   1. resubscribe            a second SUBSCRIBE on the live connection
-    #   2. unsubscribe+subscribe  a new subscription on the same connection
-    #   3. reconnect              what the hourly keepalive does
+    #   online   resubscribe to that topic.  In practice the stream comes
+    #            back ~0.4 s after the SUBACK.
+    #   offline  do nothing; a SUBSCRIBE sent before the device is back has
+    #            no effect.  Re-check later.
+    #   unknown  (the cloud could not be asked) resubscribe anyway.
     #
-    # then stand down until data flows again.  In practice the stream comes
-    # back ~0.4 s after the first SUBACK that follows the device's return.
-    #
-    # A step taken before the device's return cannot have reached it, so if
-    # the cloud reports a device session that began after the last step, the
-    # steps start over from 1, also after standing down.  This matters when
-    # the network fails: the cloud keeps reporting the old session as online
-    # for about 90 s, long enough for early steps to go to a device that is
-    # not there.
-    #
-    # Before each step the device state is read from the Phyn cloud.  While
-    # the cloud reports the device offline no step is taken (a SUBSCRIBE sent
-    # before the device is back has no effect); the state is re-checked every
-    # _SILENCE_OFFLINE_RECHECK seconds for the first _SILENCE_OFFLINE_FAST
-    # seconds, then every _SILENCE_SLOW_RECHECK seconds, so a long outage
-    # costs about 12 cloud reads an hour.  If the cloud cannot be asked, the
-    # step is taken anyway.
+    # Checks repeat every _SILENCE_RETRY seconds for the first
+    # _SILENCE_FAST_PERIOD seconds of a silence or of an offline period,
+    # then every _SILENCE_SLOW_RETRY seconds, so a long outage costs about
+    # 12 cloud reads an hour.  Routine recoveries are logged at INFO; if
+    # _SILENCE_WARN_AFTER resubscribes in a row to an online device did not
+    # bring data back, that is logged at WARNING (once), and so is the
+    # eventual recovery.
     # ------------------------------------------------------------------
 
-    _WATCHDOG_STEPS = ("resubscribe", "unsubscribe+subscribe", "reconnect")
+    def _watchdog_watch(self, topic: str, now: Optional[float] = None) -> Optional[_TopicWatch]:
+        """The watch for a device topic, created on first use; None for other topics."""
+        if not topic.startswith(_DEVICE_TOPIC_PREFIX):
+            return None
+        watches = self.__dict__.setdefault("_wd_topics", {})
+        watch = watches.get(topic)
+        if watch is None:
+            watch = watches[topic] = _TopicWatch(time.monotonic() if now is None else now)
+        return watch
 
-    def _watchdog_note_rx(self, seq: Optional[int] = None) -> None:
+    def _watchdog_note_suback(self, topic: str) -> None:
+        watch = self._watchdog_watch(topic)
+        if watch is not None:
+            watch.last_suback = time.monotonic()
+
+    def _watchdog_note_rx(self, topic: str, seq: Optional[int] = None) -> None:
+        watch = self._watchdog_watch(topic)
+        if watch is None:
+            return
         now = time.monotonic()
-        if self._wd_silent:
-            # Report the most recent SUBACK whoever sent it: the reconnect
-            # loop or a reload can end a silence as well as a watchdog step.
-            # The seq pair separates a device that started a new session
-            # (-> 0) from data merely delayed by the network (n -> n+1).
+        if watch.silent:
+            # The seq pair separates a device that reconnected after a
+            # restart (-> 0) from one that kept its counter (n -> n+1, which
+            # is also what data merely delayed by the network looks like).
             seq_txt = "seq %s -> %s" % (
-                "?" if self._wd_last_seq is None else self._wd_last_seq,
+                "?" if watch.last_seq is None else watch.last_seq,
                 "?" if seq is None else seq,
             )
-            if self._wd_last_step is None:
-                _LOGGER.warning(
-                    "WATCHDOG stream resumed on its own after %.0fs silent, "
-                    "%.2fs after SUBACK (no step taken, %s)",
-                    now - self._wd_last_rx, now - self._wd_last_suback,
-                    seq_txt,
+            level = logging.WARNING if watch.warned else logging.INFO
+            if watch.attempts:
+                _LOGGER.log(
+                    level,
+                    "WATCHDOG %s: stream resumed %.2fs after SUBACK, %.2fs after "
+                    "resubscribe (%d resubscribe(s), %.0fs since last message, %s)",
+                    self._watchdog_device_id(topic), now - watch.last_suback,
+                    now - watch.last_attempt_at, watch.attempts,
+                    now - watch.last_rx, seq_txt,
                 )
             else:
-                _LOGGER.warning(
-                    "WATCHDOG stream resumed %.2fs after SUBACK, %.2fs after "
-                    "step '%s' (%d step(s) taken, %.0fs since last message, %s)",
-                    now - self._wd_last_suback,
-                    now - self._wd_last_step_at, self._wd_last_step,
-                    self._wd_step, now - self._wd_last_rx, seq_txt,
+                _LOGGER.log(
+                    level,
+                    "WATCHDOG %s: stream resumed on its own after %.0fs silent, "
+                    "%.2fs after SUBACK (%s)",
+                    self._watchdog_device_id(topic), now - watch.last_rx,
+                    now - watch.last_suback, seq_txt,
                 )
         if seq is not None:
-            self._wd_last_seq = seq
-        self._wd_last_rx = now
-        self._wd_silent = False
-        self._wd_held = False
-        self._wd_held_since = 0.0
-        self._wd_step = 0
-        self._wd_next_at = 0.0
-        self._wd_last_step = None
-        self._wd_last_step_at = 0.0
+            watch.last_seq = seq
+        watch.last_rx = now
+        watch.silent = False
+        watch.silent_since = 0.0
+        watch.next_at = 0.0
+        watch.offline_since = 0.0
+        watch.attempts = 0
+        watch.last_attempt_at = 0.0
+        watch.warned = False
 
-    def _watchdog_device_id(self) -> Optional[str]:
-        for topic in self.topics:
-            if topic.startswith("prd/app_subscriptions/"):
-                return topic.split("/")[2]
-        return None
+    @staticmethod
+    def _watchdog_device_id(topic: str) -> str:
+        return topic[len(_DEVICE_TOPIC_PREFIX):].split("/")[0]
 
-    async def _watchdog_device_online(self, step: str) -> Optional[bool]:
+    async def _watchdog_device_online(self, device_id: str) -> Optional[bool]:
         """Ask the Phyn cloud whether the device is online.
 
         True/False as reported; None if it could not be asked.
         """
-        device_id = self._watchdog_device_id()
-        if device_id is None:
-            return None
         try:
             state = await self.api.device.get_state(device_id)
         except Exception as err:  # pylint: disable=broad-except
-            _LOGGER.info("WATCHDOG could not read device state before '%s': %r", step, err)
+            _LOGGER.info("WATCHDOG %s: could not read device state: %r", device_id, err)
             return None
-        online = state.get("online_status") or {}
-        self._wd_device_since = (
-            online.get("ts") if online.get("v") == "online" else None
-        )
+        online = (state or {}).get("online_status") or {}
         _LOGGER.debug(
-            "WATCHDOG device state before '%s': online_status=%s since %s",
-            step, online.get("v"), online.get("ts"),
+            "WATCHDOG %s: device state online_status=%s since %s",
+            device_id, online.get("v"), online.get("ts"),
         )
         return online.get("v") == "online"
 
-    def _watchdog_new_session(self) -> bool:
-        """True if the device started a cloud session after the last step."""
-        since = self._wd_device_since
-        return (
-            self._wd_last_step is not None
-            and isinstance(since, (int, float))
-            and since / 1000 > self._wd_last_step_wall
-        )
-
-    async def _watchdog_run_step(self, step: str) -> None:
-        topics = list(set(self.topics))
-        if step == "resubscribe":
-            for topic in topics:
-                await self.subscribe(topic)
-        elif step == "unsubscribe+subscribe":
-            for topic in topics:
-                self.client.unsubscribe(topic)
-            for topic in topics:
-                await self.subscribe(topic)
-        elif step == "reconnect":
-            await self._process_reconnect()
-
     async def _watchdog_tick(self) -> None:
-        # Not a silence if we are down, reconnecting, mid-handshake or leaving.
+        # Not a silence if we are down, reconnecting or leaving.
         if (self.disconnect_evt is not None
                 or self.reconnect_evt.is_set()
-                or not self.is_connected()
-                or self.pending_acks
-                or not self.topics):
+                or not self.is_connected()):
             return
+        pending = set(self.pending_acks.values())
+        for topic in list(dict.fromkeys(self.topics)):
+            if topic in pending:
+                continue            # mid-subscribe; its SUBACK restarts the clock
+            watch = self._watchdog_watch(topic)
+            if watch is not None:
+                await self._watchdog_check(topic, watch)
 
+    async def _watchdog_check(self, topic: str, watch: _TopicWatch) -> None:
         now = time.monotonic()
-        silent_for = now - max(self._wd_last_rx, self._wd_last_suback)
-        if silent_for < _SILENCE_THRESHOLD:
-            return
-
-        if not self._wd_silent:
-            self._wd_silent = True
-            _LOGGER.warning(
-                "WATCHDOG silence: connected and subscribed, no message for "
-                "%.0fs (last message %.0fs ago)",
-                silent_for, now - self._wd_last_rx,
-            )
-
-        if now < self._wd_next_at:
-            return
-
-        steps = self._WATCHDOG_STEPS
-        step = steps[self._wd_step] if self._wd_step < len(steps) else None
-        online = await self._watchdog_device_online(step or "stand down")
-
-        if online and self._watchdog_new_session():
+        silent_for = now - max(watch.last_rx, watch.last_suback)
+        if not watch.silent:
+            if silent_for < _SILENCE_THRESHOLD:
+                return
+            watch.silent = True
+            watch.silent_since = now
             _LOGGER.info(
-                "WATCHDOG device started a new session after step '%s'; "
-                "starting over", self._wd_last_step,
+                "WATCHDOG %s: no message for %.0fs (last message %.0fs ago); "
+                "checking device state",
+                self._watchdog_device_id(topic), silent_for, now - watch.last_rx,
             )
-            self._wd_step = 0
-            step = steps[0]
-
-        if step is None:
-            # All steps taken.  Stand down (logged once), but keep checking
-            # for a new device session, at the slow interval.
-            if self._wd_step == len(steps):
-                _LOGGER.warning(
-                    "WATCHDOG stand down: %d step(s) did not restore the stream "
-                    "(%.0fs since last message)",
-                    self._wd_step, now - self._wd_last_rx,
-                )
-                self._wd_step += 1
-            self._wd_next_at = time.monotonic() + _SILENCE_SLOW_RECHECK
+        if now < watch.next_at:
             return
+
+        device_id = self._watchdog_device_id(topic)
+        online = await self._watchdog_device_online(device_id)
+        now = time.monotonic()
 
         if online is False:
-            held_now = time.monotonic()
-            if not self._wd_held_since:
-                self._wd_held_since = held_now
-            held_for = held_now - self._wd_held_since
-            interval = (_SILENCE_OFFLINE_RECHECK if held_for < _SILENCE_OFFLINE_FAST
-                        else _SILENCE_SLOW_RECHECK)
-            if not self._wd_held:
+            if not watch.offline_since:
+                watch.offline_since = now
                 _LOGGER.info(
-                    "WATCHDOG holding '%s': the Phyn cloud reports the device "
-                    "offline; re-checking every %.0fs", step, interval,
+                    "WATCHDOG %s: the Phyn cloud reports the device offline; "
+                    "re-checking every %.0fs", device_id, _SILENCE_RETRY,
                 )
-            elif interval == _SILENCE_SLOW_RECHECK and held_for - _SILENCE_OFFLINE_FAST < interval:
-                _LOGGER.info(
-                    "WATCHDOG device still offline after %.0f min; re-checking "
-                    "every %.0fs", held_for / 60, interval,
-                )
+            offline_for = now - watch.offline_since
+            if offline_for < _SILENCE_FAST_PERIOD:
+                interval = _SILENCE_RETRY
             else:
-                _LOGGER.debug("WATCHDOG still holding '%s'", step)
-            self._wd_held = True
-            self._wd_next_at = held_now + interval
+                interval = _SILENCE_SLOW_RETRY
+                if offline_for - _SILENCE_FAST_PERIOD < _SILENCE_SLOW_RETRY:
+                    _LOGGER.info(
+                        "WATCHDOG %s: device still offline after %.0f min; "
+                        "re-checking every %.0fs",
+                        device_id, offline_for / 60, _SILENCE_SLOW_RETRY,
+                    )
+            # Resubscribes sent before the device went offline could not
+            # have helped; count afresh once it is back.
+            watch.attempts = 0
+            watch.next_at = now + interval
             return
 
+        if watch.offline_since:
+            _LOGGER.info(
+                "WATCHDOG %s: device back online after %.0fs",
+                device_id, now - watch.offline_since,
+            )
+            watch.offline_since = 0.0
+
+        if watch.attempts >= _SILENCE_WARN_AFTER and not watch.warned:
+            watch.warned = True
+            _LOGGER.warning(
+                "WATCHDOG %s: %d resubscribe(s) did not restore the stream "
+                "(%.0fs since last message); retrying every %.0fs",
+                device_id, watch.attempts, now - watch.last_rx, _SILENCE_SLOW_RETRY,
+            )
+
         _LOGGER.info(
-            "WATCHDOG step %d/%d '%s' starting (%.0fs since last message)",
-            self._wd_step + 1, len(self._WATCHDOG_STEPS), step,
-            now - self._wd_last_rx,
+            "WATCHDOG %s: resubscribing (%.0fs since last message, device %s)",
+            device_id, now - watch.last_rx,
+            "online" if online else "state unknown",
         )
         try:
-            await self._watchdog_run_step(step)
+            await self.subscribe(topic)
         except Exception as err:  # pylint: disable=broad-except
-            _LOGGER.warning("WATCHDOG step '%s' raised: %r", step, err)
-        self._wd_last_step = step
-        self._wd_last_step_at = time.monotonic()
-        self._wd_last_step_wall = time.time()
-        self._wd_held_since = 0.0
-        self._wd_step += 1
-        self._wd_next_at = self._wd_last_step_at + _SILENCE_STEP_SPACING
+            _LOGGER.warning("WATCHDOG %s: resubscribe raised: %r", device_id, err)
+        watch.attempts += 1
+        watch.last_attempt_at = time.monotonic()
+        slow = watch.warned or now - watch.silent_since >= _SILENCE_FAST_PERIOD
+        watch.next_at = watch.last_attempt_at + (_SILENCE_SLOW_RETRY if slow else _SILENCE_RETRY)
 
     async def _watchdog(self) -> None:
         while True:
